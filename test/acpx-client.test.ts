@@ -13,6 +13,10 @@ type WireMessage = Record<string, unknown>;
 
 const servers: Array<ReturnType<typeof Bun.serve>> = [];
 const tempDirs: string[] = [];
+// acpx includes Windows process-identity queries in startup, and separately
+// allows up to 8s for cleanup. Keep both limits bounded with room for that work.
+const acpxResponseTimeoutSeconds = process.platform === "win32" ? 15 : 5;
+const acpxTestTimeoutMs = process.platform === "win32" ? 45_000 : 10_000;
 
 afterEach(() => {
   for (const server of servers.splice(0)) server.stop(true);
@@ -193,7 +197,7 @@ async function runAcpx(
       "--format",
       format,
       "--timeout",
-      "5",
+      String(acpxResponseTimeoutSeconds),
       "test-adapter",
       ...command,
     ],
@@ -343,7 +347,7 @@ describe("acpx client compatibility", () => {
   test("completes a prompt through a real ACP client", async () => {
     const { stdout } = await runAcpx("quiet");
     expect(stdout.trim()).toBe("ACPX_OK");
-  }, 10_000);
+  }, acpxTestTimeoutMs);
 
   test("records a new ACP session for discovery", async () => {
     const { home, appServerUrl, cwd } = await runAcpx("quiet");
@@ -355,7 +359,7 @@ describe("acpx client compatibility", () => {
     expect(await registry.list(TEST_RUNTIME.agent_id, cwd)).toEqual([
       expect.objectContaining({ sessionId: TEST_RUNTIME.conversation_id, cwd }),
     ]);
-  }, 10_000);
+  }, acpxTestTimeoutMs);
 
   test("lists project sessions through a real ACP client", async () => {
     const cwd = join(import.meta.dir, "..");
@@ -370,7 +374,7 @@ describe("acpx client compatibility", () => {
       title: "ACP client compatibility session",
       cwd,
     }));
-  }, 10_000);
+  }, acpxTestTimeoutMs);
 
   test("waits for MCP subprocess cleanup after the client disconnects", async () => {
     await verifyMcpShutdownOnClientDisconnect();
@@ -400,5 +404,5 @@ describe("acpx client compatibility", () => {
       sessionUpdate: "agent_message_chunk",
       content: { type: "text", text: "ACPX_OK" },
     });
-  }, 10_000);
+  }, acpxTestTimeoutMs);
 });
