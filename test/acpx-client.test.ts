@@ -57,6 +57,14 @@ function startFakeAppServer() {
             }));
             return;
           }
+          case "agent_retrieve":
+            socket.send(JSON.stringify({
+              type: "agent_retrieve_response",
+              request_id: requiredString(message.request_id),
+              success: true,
+              agent: { id: TEST_RUNTIME.agent_id, model: "test/model", model_settings: {} },
+            }));
+            return;
           case "conversation_retrieve":
             socket.send(JSON.stringify({
               type: "conversation_retrieve_response",
@@ -87,6 +95,14 @@ function startFakeAppServer() {
                 isDefault: true,
               }],
               available_handles: ["test/model"],
+            }));
+            return;
+          case "update_model":
+            socket.send(JSON.stringify({
+              type: "update_model_response",
+              request_id: requiredString(message.request_id),
+              success: false,
+              error: "provider rejected token=TEST_SECRET_DO_NOT_LOG",
             }));
             return;
           case "input": {
@@ -344,6 +360,73 @@ async function verifyMcpShutdownOnClientDisconnect(): Promise<void> {
 }
 
 describe("acpx client compatibility", () => {
+  test("preserves actionable configuration errors across the ACP wire without leaking backend details", async () => {
+    const home = mkdtempSync(join(tmpdir(), "letta-acp-config-wire-"));
+    tempDirs.push(home);
+    const child = Bun.spawn([process.execPath, join(import.meta.dir, "..", "src", "index.ts")], {
+      env: {
+        ...process.env,
+        HOME: home,
+        USERPROFILE: home,
+        LETTA_ACP_BACKEND: "remote",
+        LETTA_APP_SERVER_URL: startFakeAppServer(),
+        LETTA_AGENT_ID: TEST_RUNTIME.agent_id,
+      },
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const stderr = new Response(child.stderr).text();
+    const pending = new Map<number, (message: WireMessage) => void>();
+    const reading = (async () => {
+      let buffer = "";
+      const decoder = new TextDecoder();
+      for await (const chunk of child.stdout) {
+        buffer += decoder.decode(chunk, { stream: true });
+        let newline;
+        while ((newline = buffer.indexOf("\n")) !== -1) {
+          const line = buffer.slice(0, newline);
+          buffer = buffer.slice(newline + 1);
+          if (!line.trim()) continue;
+          const message = JSON.parse(line) as WireMessage;
+          if (typeof message.id === "number") {
+            pending.get(message.id)?.(message);
+            pending.delete(message.id);
+          }
+        }
+      }
+    })();
+    let id = 0;
+    const request = (method: string, params: WireMessage) => {
+      const requestId = ++id;
+      const response = new Promise<WireMessage>((resolve) => pending.set(requestId, resolve));
+      child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: requestId, method, params })}\n`);
+      return response;
+    };
+    try {
+      await request("initialize", { protocolVersion: 1, clientCapabilities: {} });
+      const opened = await request("session/new", { cwd: join(import.meta.dir, ".."), mcpServers: [] });
+      const sessionId = (opened.result as WireMessage).sessionId;
+      const invalid = await request("session/set_config_option", { sessionId, configId: "reasoning_effort", value: "bogus" });
+      expect(invalid.error).toMatchObject({ code: -32602 });
+      expect((invalid.error as WireMessage).message).toContain("Unsupported reasoning effort");
+      const failed = await request("session/set_config_option", { sessionId, configId: "model", value: "test/another-model" });
+      expect(failed.error).toMatchObject({ code: -32603 });
+      expect((failed.error as WireMessage).message).toContain("Letta model update failed");
+      expect(JSON.stringify(failed)).not.toContain("TEST_SECRET_DO_NOT_LOG");
+      child.stdin.end();
+      expect(await child.exited).toBe(0);
+      await reading;
+      const diagnostics = await stderr;
+      expect(diagnostics).toContain("model configuration update failed");
+      expect(diagnostics).not.toContain("TEST_SECRET_DO_NOT_LOG");
+    } finally {
+      if (child.exitCode === null) child.kill();
+      await child.exited;
+      await reading;
+    }
+  }, 12_000);
+
   test("completes a prompt through a real ACP client", async () => {
     const { stdout } = await runAcpx("quiet");
     expect(stdout.trim()).toBe("ACPX_OK");

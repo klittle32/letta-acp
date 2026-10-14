@@ -13,6 +13,7 @@ import {
   type NewSessionRequest,
   type NewSessionResponse,
   PROTOCOL_VERSION,
+  RequestError,
   type PromptRequest,
   type PromptResponse,
   type RequestPermissionResponse,
@@ -34,9 +35,30 @@ import {
   type PermissionMode,
   type SDKMessage,
   type SDKResultMessage,
+  type UpdateModelOptions,
 } from "@letta-ai/letta-agent-sdk";
 import { authMethodsForClient } from "./auth.js";
 import { DEFAULT_ACP_MODEL, type LettaAcpConfig } from "./config.js";
+import {
+  effectiveEffort,
+  type ReasoningEffort,
+  presetEffort,
+  isReasoningEffort,
+  reasoningEntries,
+  reasoningOption,
+  scopedModelSnapshot,
+} from "./reasoning-options.js";
+import { modelHandle, modelOptions, modelSelection } from "./model-options.js";
+import {
+  REQUESTED_EFFORT_ID,
+  proxyOverrideAvailable,
+  proxyOverrideBackendAvailable,
+  requestedEffort,
+  requestedEffortOption,
+  updateProxyEffort,
+  proxyOverrideEntry,
+  type RequestedEffort,
+} from "./proxy-reasoning.js";
 import {
   createEditorTools,
   type EditorFsCapabilities,
@@ -92,12 +114,18 @@ interface AcpSessionState {
   cancelled: boolean;
   /** True only while a session/prompt handler is running. */
   promptActive: boolean;
+  /** Settled tail of mutations admitted before the next prompt reservation. */
+  configTail: Promise<void>;
+  modelCatalog?: Awaited<ReturnType<LettaCodeSession["listModels"]>>;
   /** ACP session mode; enforced adapter-side in the permission callback. */
   modeId: PermissionMode;
   /** Session working directory (for project skill discovery). */
   cwd: string;
   /** Model handle reported by the runtime, updated after ACP model changes. */
   currentModel: string | undefined;
+  reasoningEffort: ReasoningEffort | undefined;
+  requestedEffort?: RequestedEffort;
+  contextWindow: number | undefined;
 }
 
 /** Max history messages replayed on session/load. */
@@ -352,28 +380,15 @@ export class LettaAcpAgent {
   private async sessionConfigOptions(
     state: AcpSessionState,
   ): Promise<SessionConfigOption[]> {
-    const { entries } = await state.session.listModels();
-    const models = [...new Map(entries.map((entry) => [entry.id, entry])).values()];
-    const selected = models.find(
-      (entry) =>
-        entry.id === state.currentModel || entry.handle === state.currentModel,
-    );
-    let currentValue =
-      selected?.id ??
-      models.find((entry) => entry.isDefault)?.id ??
-      models[0]?.id;
-    const options = models.map((entry) => ({
-      value: entry.id,
-      name: entry.label,
-      ...(entry.description ? { description: entry.description } : {}),
-    }));
+    const { entries, byokProviderAliases } = await this.modelCatalog(state);
+    const currentValue = modelHandle(entries, state.currentModel);
+    const options = modelOptions(entries);
 
     // A custom model handle may be active even when it is not in the curated
     // catalog. ACP requires currentValue to identify one of the options, so
     // retain that model rather than falsely presenting a different selection.
-    if (!selected && state.currentModel) {
-      currentValue = state.currentModel;
-      options.unshift({ value: state.currentModel, name: state.currentModel });
+    if (currentValue && !options.some((option) => option.value === currentValue)) {
+      options.unshift({ value: currentValue, name: currentValue });
     }
     const configOptions: SessionConfigOption[] = [
       permissionModeConfigOption(state.modeId),
@@ -389,7 +404,106 @@ export class LettaAcpAgent {
         options,
       });
     }
+    const thoughtLevel = reasoningOption(
+      reasoningEntries(entries, state.currentModel, byokProviderAliases, state.contextWindow),
+      state.reasoningEffort,
+    );
+    if (proxyOverrideBackendAvailable(this.config.clientOptions) &&
+        proxyOverrideAvailable(entries, state.currentModel, state.contextWindow)) {
+      configOptions.push(requestedEffortOption(state.requestedEffort));
+    } else if (thoughtLevel) configOptions.push(thoughtLevel);
     return configOptions;
+  }
+
+  private async modelCatalog(state: AcpSessionState) {
+    try {
+      return state.modelCatalog ??= await state.session.listModels();
+    } catch {
+      log("model catalog unavailable; configuration was not changed");
+      throw RequestError.internalError(undefined, "Letta model catalog unavailable");
+    }
+  }
+
+  private mutateConfiguration<T>(state: AcpSessionState, mutation: () => Promise<T>): Promise<T> {
+    if (state.promptActive) {
+      return Promise.reject(RequestError.invalidParams(undefined, "Cannot change configuration during a prompt"));
+    }
+    const result = state.configTail.then(mutation);
+    // A failed request must not poison subsequent requests or prompt startup.
+    state.configTail = result.then(() => {}, () => {});
+    return result;
+  }
+
+  private async hydrateModelSettings(state: AcpSessionState): Promise<void> {
+    state.reasoningEffort = undefined;
+    state.requestedEffort = undefined;
+    state.contextWindow = undefined;
+    try {
+      const [agent, conversation] = await Promise.all([
+        this.client.agents.retrieve(state.session.agentId!),
+        state.session.conversationId === "default"
+          ? undefined
+          : this.client.conversations.retrieve(state.session.conversationId!),
+      ]);
+      const snapshot = scopedModelSnapshot(agent, conversation);
+      state.currentModel = snapshot.model ?? state.currentModel;
+      state.reasoningEffort = effectiveEffort(snapshot.settings, snapshot.legacy);
+      state.requestedEffort = requestedEffort(snapshot.settings);
+      state.contextWindow = snapshot.contextWindow;
+    } catch {
+      // Missing state must not become an invented "medium"/"default" selection.
+      log("persisted model settings unavailable; reasoning/context remain unconfirmed");
+    }
+  }
+
+  private async updateSessionModel(
+    state: AcpSessionState,
+    update: string | UpdateModelOptions,
+  ): Promise<void> {
+    const { entries, byokProviderAliases } = await this.modelCatalog(state);
+    state.currentModel = modelHandle(entries, state.currentModel);
+    if (typeof update === "string") {
+      let selection;
+      try {
+        selection = modelSelection(entries, update, {
+          model: state.currentModel,
+          settings: { reasoning_effort: state.reasoningEffort },
+          contextWindow: state.contextWindow,
+        }, byokProviderAliases);
+      } catch (error) {
+        throw RequestError.invalidParams(undefined, error instanceof Error ? error.message : "Ambiguous model selection");
+      }
+      if (selection === undefined) return;
+      update = selection;
+    }
+    let result;
+    try {
+      result = await state.session.updateModel(update);
+    } catch {
+      // Backend error strings can include URLs, headers, or credentials.
+      log("model configuration update failed: runtime rejected the update or is unavailable");
+      throw RequestError.internalError(undefined, "Letta model update failed; runtime rejected the update or is unavailable");
+    }
+    const selected = typeof update === "string" ? update : update.modelHandle ?? update.modelId ?? update.model;
+    state.currentModel = modelHandle(entries, result.modelHandle ?? result.modelId ?? selected);
+    state.reasoningEffort = undefined;
+    state.contextWindow = undefined;
+    // UpdateModelResult does not include a context window. Read persisted
+    // runtime scope, never infer it from the selected preset's advertised limit.
+    await this.hydrateModelSettings(state);
+    state.currentModel = modelHandle(entries, result.modelHandle ?? result.modelId ?? state.currentModel);
+    if (result.modelSettings) {
+      const effort = effectiveEffort(result.modelSettings);
+      // Incomplete responses must not erase freshly hydrated state. Explicit
+      // null, however, denotes an unknown/provider default selection.
+      if (effort !== undefined || ["reasoning", "effort", "reasoning_effort"]
+        .some((key) => result.modelSettings![key] === null)) {
+        state.reasoningEffort = effort;
+        state.requestedEffort = requestedEffort(result.modelSettings);
+      }
+    }
+    state.currentModel = modelHandle(entries, state.currentModel);
+    log(`model -> ${state.currentModel}; reasoning -> ${state.reasoningEffort ?? "unknown"}; scope -> ${result.appliedTo ?? "unknown"}`);
   }
 
   async setSessionConfigOption(
@@ -397,26 +511,78 @@ export class LettaAcpAgent {
   ): Promise<SetSessionConfigOptionResponse> {
     const state = this.sessions.get(params.sessionId);
     if (!state) {
-      throw new Error(`Unknown session: ${params.sessionId}`);
+      throw RequestError.invalidParams(undefined, "Unknown session");
     }
     if (params.configId === PERMISSION_MODE_CONFIG_ID) {
       if (typeof params.value !== "string" || !isSessionModeId(params.value)) {
-        throw new Error(`Unknown permission mode: ${String(params.value)}`);
+        throw RequestError.invalidParams(undefined, "Unknown permission mode");
       }
+      await this.modelCatalog(state);
       state.modeId = params.value;
       log(`session ${params.sessionId} mode -> ${params.value}`);
       return { configOptions: await this.sessionConfigOptions(state) };
     }
-    if (params.configId === "model") {
-      if (typeof params.value !== "string") {
-        throw new Error("The model configuration option requires a model id");
+    return this.mutateConfiguration(state, async () => {
+      // Acquire the catalog before any mutation so response construction cannot
+      // turn a successful update into a failed request.
+      await this.modelCatalog(state);
+      if (params.configId === "model") {
+        if (typeof params.value !== "string") {
+          throw RequestError.invalidParams(undefined, "The model configuration option requires a model id");
+        }
+        await this.updateSessionModel(state, params.value);
+        log(`session ${params.sessionId} model -> ${state.currentModel}`);
+        return { configOptions: await this.sessionConfigOptions(state) };
       }
-      const result = await state.session.updateModel(params.value);
-      state.currentModel = result.modelHandle ?? result.modelId ?? params.value;
-      log(`session ${params.sessionId} model -> ${state.currentModel}`);
-      return { configOptions: await this.sessionConfigOptions(state) };
-    }
-    throw new Error(`Unknown session configuration option: ${params.configId}`);
+      if (params.configId === REQUESTED_EFFORT_ID) {
+        const { entries } = await this.modelCatalog(state);
+        const entry = proxyOverrideEntry(entries, state.currentModel, state.contextWindow);
+        if (!proxyOverrideBackendAvailable(this.config.clientOptions) || !entry ||
+            (params.value !== "default" && !isReasoningEffort(params.value))) {
+          throw RequestError.invalidParams(undefined, "Unsupported requested effort override for the current model");
+        }
+        let settings;
+        try {
+          settings = await updateProxyEffort(state.session, entry, params.value);
+        } catch {
+          // A malformed acknowledgement can follow a persisted update. Re-read
+          // authoritative state; never claim that the requested value succeeded.
+          await this.hydrateModelSettings(state);
+          try {
+            await state.clientContext.notify(methods.client.session.update, {
+              sessionId: params.sessionId,
+              update: {
+                sessionUpdate: "config_option_update",
+                configOptions: await this.sessionConfigOptions(state),
+              },
+            });
+          } catch {
+            log("proxy configuration refresh notification unavailable");
+          }
+          log("proxy reasoning update failed: runtime rejected the update or returned an invalid response");
+          throw RequestError.internalError(undefined, "Letta requested effort update failed");
+        }
+        await this.hydrateModelSettings(state);
+        state.requestedEffort = requestedEffort(settings);
+        state.reasoningEffort = effectiveEffort(settings);
+        return { configOptions: await this.sessionConfigOptions(state) };
+      }
+      if (params.configId === "reasoning_effort") {
+        const { entries, byokProviderAliases } = await this.modelCatalog(state);
+        state.currentModel = modelHandle(entries, state.currentModel);
+        const supported = reasoningEntries(entries, state.currentModel, byokProviderAliases, state.contextWindow);
+        if (!isReasoningEffort(params.value) ||
+            !supported.some((entry) => presetEffort(entry) === params.value)) {
+          throw RequestError.invalidParams(undefined, "Unsupported reasoning effort for the current model");
+        }
+        await this.updateSessionModel(state, {
+          modelId: supported.find((entry) => presetEffort(entry) === params.value)!.id,
+          modelHandle: state.currentModel,
+        });
+        return { configOptions: await this.sessionConfigOptions(state) };
+      }
+      throw RequestError.invalidParams(undefined, "Unknown session configuration option");
+    });
   }
 
   async setSessionMode(
@@ -425,10 +591,10 @@ export class LettaAcpAgent {
   ): Promise<SetSessionModeResponse> {
     const state = this.sessions.get(params.sessionId);
     if (!state) {
-      throw new Error(`Unknown session: ${params.sessionId}`);
+      throw RequestError.invalidParams(undefined, "Unknown session");
     }
     if (!isSessionModeId(params.modeId)) {
-      throw new Error(`Unknown mode: ${params.modeId}`);
+      throw RequestError.invalidParams(undefined, "Unknown mode");
     }
     state.modeId = params.modeId;
     log(`session ${params.sessionId} mode -> ${params.modeId}`);
@@ -510,10 +676,14 @@ export class LettaAcpAgent {
       alwaysAllowed: new Set(),
       cancelled: false,
       promptActive: false,
+      configTail: Promise.resolve(),
       modeId: this.config.permissionMode,
       cwd: options.cwd,
       currentModel: bootstrap.model ?? this.config.model,
+      reasoningEffort: undefined,
+      contextWindow: undefined,
     };
+    await this.hydrateModelSettings(state);
     // A client may load the same conversation again while its prior ACP
     // session is still open. Close the displaced SDK session before replacing
     // it so its sockets and per-session MCP subprocesses are not orphaned.
@@ -546,11 +716,18 @@ export class LettaAcpAgent {
     if (!state) {
       throw new Error(`Unknown session: ${params.sessionId}`);
     }
+    if (state.promptActive) {
+      throw RequestError.invalidParams(undefined, "A prompt is already active for this session");
+    }
     state.clientContext = cx;
     state.cancelled = false;
     state.promptActive = true;
 
     try {
+      // Reserve synchronously, then drain only previously admitted mutations.
+      // /model below runs inside this reservation, not through the queue.
+      await state.configTail;
+      if (state.cancelled) return { stopReason: "cancelled" };
       const commandResponse = await this.maybeRunCommand(params, state, cx);
       if (commandResponse) return commandResponse;
       await state.session.send(toLettaContent(params.prompt));
@@ -644,7 +821,7 @@ export class LettaAcpAgent {
     };
     try {
       if (!argument) {
-        const result = await state.session.listModels();
+        const result = await this.modelCatalog(state);
         const lines = result.entries.map((model) => {
           const marks = [
             model.isDefault ? "default" : null,
@@ -652,14 +829,24 @@ export class LettaAcpAgent {
           ]
             .filter(Boolean)
             .join(", ");
-          return `- \`${model.handle}\` — ${model.label}${marks ? ` (${marks})` : ""}`;
+          const preset = [
+            model.updateArgs?.reasoning_effort ? `effort: ${model.updateArgs.reasoning_effort}` : null,
+            model.updateArgs?.context_window ? `context: ${model.updateArgs.context_window}` : null,
+          ].filter(Boolean).join(", ");
+          return `- \`${model.id}\` — ${model.label}; handle: \`${model.handle}\`${preset ? `; ${preset}` : ""}${marks ? ` (${marks})` : ""}`;
         });
         await reply(
-          `Available models:\n${lines.join("\n")}\n\nSwitch with \`/model <handle>\`.`,
+          `Available models:\n${lines.join("\n")}\n\nSwitch with \`/model <handle-or-preset-id>\`.`,
         );
       } else {
-        const result = await state.session.updateModel(argument);
-        state.currentModel = result.modelHandle ?? result.modelId ?? argument;
+        await this.updateSessionModel(state, argument);
+        await cx.notify(methods.client.session.update, {
+          sessionId: params.sessionId,
+          update: {
+            sessionUpdate: "config_option_update",
+            configOptions: await this.sessionConfigOptions(state),
+          },
+        });
         await reply(`Model switched to \`${state.currentModel}\`.`);
       }
     } catch (error) {
@@ -855,7 +1042,7 @@ export class LettaAcpAgent {
     }
   }
 
-  shutdown(): void {
+  async shutdown(): Promise<void> {
     for (const state of this.sessions.values()) {
       try {
         state.session.close();
@@ -864,6 +1051,11 @@ export class LettaAcpAgent {
       }
     }
     this.sessions.clear();
+    try {
+      await this.client.close();
+    } catch {
+      log("client close failed during shutdown");
+    }
   }
 
   /**

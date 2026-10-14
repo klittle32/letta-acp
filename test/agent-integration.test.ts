@@ -3,8 +3,9 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentContext, McpServer } from "@agentclientprotocol/sdk";
-import type { LettaCodeSocketConstructor } from "@letta-ai/letta-agent-sdk";
+import type { LettaCodeSession, LettaCodeSocketConstructor } from "@letta-ai/letta-agent-sdk";
 import { LettaAcpAgent, toSdkMcpServers } from "../src/agent.js";
+import { configFromEnv, type LettaAcpConfig } from "../src/config.js";
 import { SessionRegistry } from "../src/session-registry.js";
 
 interface RuntimeScope {
@@ -28,6 +29,42 @@ class FakeAppServer {
   readonly conversationRetrieveIds: string[] = [];
   closedSockets = 0;
   readonly updatedModelPayloads: WireMessage[] = [];
+  readonly inputModels: string[] = [];
+  reasoningModel = false;
+  anthropicReasoning = false;
+  legacyXhigh = true;
+  updateResponseSettings: WireMessage | undefined;
+  modelSettings: WireMessage = {};
+  modelHandle = "test/model";
+  rejectModelUpdate = false;
+  rejectCatalog = false;
+  catalogRequests = 0;
+  alternateReasoning = false;
+  alternateWindows = false;
+  contextWindow: number | undefined;
+  proxyRoute: string | undefined;
+  proxyMarked = true;
+  proxyPresetId: string | undefined;
+  proxyCloud = false;
+  persistedProxyResponse: WireMessage | "timeout" | undefined;
+  normalizedProxyEffort: string | undefined;
+  proxyCatalogWindow: number | undefined;
+  unrelatedProxyReply = false;
+  rejectModelState = false;
+  malformedProxyResponse: WireMessage | undefined;
+  private pausedUpdate: ((resume: () => void) => void) | undefined;
+
+  pauseNextModelUpdate() {
+    let release!: () => void;
+    let started!: () => void;
+    const received = new Promise<void>((resolve) => { started = resolve; });
+    this.pausedUpdate = (resume) => {
+      release = resume;
+      started();
+    };
+    return { received, release: () => release() };
+  }
+
   private nextConversation = 0;
   private activeControlSocket: ServerSocket | null = null;
   private activeRuntime: RuntimeScope | null = null;
@@ -146,6 +183,12 @@ class FakeAppServer {
     if (socket.channel !== "control") {
       throw new Error(`Unexpected command on ${socket.channel} channel`);
     }
+    if (message.type === "update_model" && this.pausedUpdate) {
+      const pause = this.pausedUpdate;
+      this.pausedUpdate = undefined;
+      pause(() => this.receive(socket, message));
+      return;
+    }
 
     switch (message.type) {
       case "runtime_start": {
@@ -187,13 +230,21 @@ class FakeAppServer {
           memory_directory: "/tmp/letta-acp-memory",
         });
         return;
+      case "agent_retrieve":
+        socket.push({
+          type: "agent_retrieve_response",
+          request_id: message.request_id,
+          success: true,
+          agent: { id: "agent-test", model: "test/model", model_settings: {} },
+        });
+        return;
       case "conversation_retrieve": {
         const conversationId = requiredString(
           message.conversation_id,
           "conversation_retrieve.conversation_id",
         );
         this.conversationRetrieveIds.push(conversationId);
-        if (conversationId.includes("missing")) {
+        if (conversationId.includes("missing") || this.rejectModelState) {
           socket.push({
             type: "conversation_retrieve_response",
             request_id: requiredString(
@@ -216,6 +267,9 @@ class FakeAppServer {
             id: conversationId,
             agent_id: conversationId.includes("foreign") ? "agent-other" : "agent-test",
             archived: conversationId.includes("archived"),
+            model: this.modelHandle,
+            model_settings: this.modelSettings,
+            context_window_limit: this.contextWindow,
           },
         });
         return;
@@ -233,11 +287,32 @@ class FakeAppServer {
         });
         return;
       case "list_models":
+        this.catalogRequests += 1;
+        if (this.rejectCatalog) {
+          socket.push({
+            type: "list_models_response",
+            request_id: message.request_id,
+            success: false,
+            error: "catalog unavailable",
+          });
+          return;
+        }
         socket.push({
           type: "list_models_response",
           request_id: requiredString(message.request_id, "list_models.request_id"),
           success: true,
           entries: [
+            ...(this.proxyRoute ? [{
+              id: this.proxyPresetId ?? this.proxyRoute,
+              handle: this.proxyRoute,
+              label: "Proxy model",
+              description: "",
+              updateArgs: {
+                provider_type: "openai",
+                openai_compatible_proxy: this.proxyMarked,
+                context_window: this.proxyCatalogWindow,
+              },
+            }] : []),
             {
               id: "test-model",
               handle: "test/model",
@@ -251,6 +326,30 @@ class FakeAppServer {
               label: "Other Model",
               description: "Alternate deterministic model",
             },
+            ...(this.reasoningModel ? (this.anthropicReasoning ? ["none", "high", ...(this.legacyXhigh ? ["xhigh"] : []), "max"] : ["low", "high"]).map((effort) => ({
+              id: `test-${effort}`,
+              handle: "test/model",
+              label: `Test ${effort}`,
+              description: "",
+              updateArgs: {
+                reasoning_effort: effort,
+                ...(this.anthropicReasoning ? { provider_type: "anthropic", ...(effort === "none" ? { enable_reasoner: false } : {}) } : {}),
+              },
+            })) : []),
+            ...(this.alternateReasoning ? ["low", "high"].map((effort) => ({
+              id: `other-${effort}`,
+              handle: "test/other-model",
+              label: `Other ${effort}`,
+              description: "",
+              updateArgs: { reasoning_effort: effort, context_window: 100_000 },
+            })) : []),
+            ...(this.alternateWindows ? [{
+              id: "other-high-large",
+              handle: "test/other-model",
+              label: "Other high large",
+              description: "",
+              updateArgs: { reasoning_effort: "high", context_window: 200_000 },
+            }] : []),
           ],
           available_handles: ["test/model", "test/other-model"],
         });
@@ -258,6 +357,31 @@ class FakeAppServer {
       case "update_model": {
         const payload = message.payload as WireMessage;
         this.updatedModelPayloads.push(payload);
+        if (this.unrelatedProxyReply) {
+          socket.push({
+            type: "update_model_response",
+            request_id: "unrelated-request",
+            success: false,
+            error: "must not settle the active request",
+          });
+        }
+        if (this.malformedProxyResponse) {
+          socket.push({
+            type: "update_model_response",
+            request_id: message.request_id,
+            ...this.malformedProxyResponse,
+          });
+          return;
+        }
+        if (this.rejectModelUpdate) {
+          socket.push({
+            type: "update_model_response",
+            request_id: message.request_id,
+            success: false,
+            error: "model update rejected",
+          });
+          return;
+        }
         const modelHandle =
           typeof payload.model_handle === "string" ? payload.model_handle : undefined;
         const modelId =
@@ -268,7 +392,33 @@ class FakeAppServer {
               : requiredString(payload.model_id, "update_model.model_id");
         const handle =
           modelHandle ??
-          (modelId === "other-model" ? "test/other-model" : "test/model");
+          (modelId.startsWith("other-") ? "test/other-model" : "test/model");
+        this.modelHandle = handle;
+        this.modelSettings = /^(test|other)-(low|high)$/.test(modelId)
+          ? { provider_type: "openai", reasoning: { reasoning_effort: modelId.split("-")[1] } }
+          : {};
+        if (this.anthropicReasoning) {
+          const effort = modelId.split("-")[1];
+          this.modelSettings = effort === "none"
+            ? { provider_type: "anthropic", thinking: { type: "disabled" } }
+            : { provider_type: "anthropic", effort: effort === "xhigh" ? "max" : effort };
+        }
+        // models2 lacks the flag even though list_models decorates its entry.
+        // ID resolution merges native inventory locally; handle-only resolution
+        // returns models2 unchanged. Cloud id==handle skips that inventory merge.
+        const resolvedProxy = this.proxyMarked &&
+          payload.model_id === (this.proxyPresetId ?? this.proxyRoute) &&
+          payload.model_handle === this.proxyRoute &&
+          !(this.proxyCloud && payload.model_id === payload.model_handle);
+        if (this.proxyRoute && resolvedProxy && Object.hasOwn(payload, "reasoning_effort")) {
+          this.modelSettings = {
+            provider_type: "openai",
+            reasoning: payload.reasoning_effort === null ? null : {
+              reasoning_effort: this.normalizedProxyEffort ?? payload.reasoning_effort,
+            },
+          };
+        }
+        if (this.persistedProxyResponse === "timeout") return;
         socket.push({
           type: "update_model_response",
           request_id: requiredString(message.request_id, "update_model.request_id"),
@@ -277,10 +427,13 @@ class FakeAppServer {
           applied_to: "conversation",
           model_id: modelId,
           model_handle: handle,
+          model_settings: this.updateResponseSettings ?? this.modelSettings,
+          ...this.persistedProxyResponse,
         });
         return;
       }
       case "input":
+        this.inputModels.push(this.modelHandle);
         this.handleInput(socket, message);
         return;
       case "execute_command":
@@ -638,11 +791,16 @@ function createAgent(
     outOfTurnPermissionTimeoutMs?: number;
     prematureResultGraceMs?: number;
   } = {},
+  // The fake server implements API proxy inventory semantics, not listLocalModels.
+  clientOptions: LettaAcpConfig["clientOptions"] =
+    configFromEnv({ LETTA_ACP_BACKEND: "cloud-oauth" }).clientOptions,
 ): LettaAcpAgent {
+  if (clientOptions.backend !== "local") throw new Error("Fake transport requires local SDK transport");
   return new LettaAcpAgent({
     clientOptions: {
       backend: "local",
       appServer: {
+        ...clientOptions.appServer,
         url: "ws://fake-app-server.test/ws",
         WebSocket: server.socketConstructor(),
         requestTimeoutMs: 1_000,
@@ -757,7 +915,7 @@ describe("Agent SDK app-server integration", () => {
         sse: true,
       });
     } finally {
-      agent.shutdown();
+      await agent.shutdown();
     }
   });
 
@@ -783,7 +941,7 @@ describe("Agent SDK app-server integration", () => {
       expect(server.createdAgentBodies[0]).not.toHaveProperty("hidden", true);
       expect(server.createdAgentPinGlobals).toEqual([false]);
     } finally {
-      agent.shutdown();
+      await agent.shutdown();
     }
   });
 
@@ -802,7 +960,7 @@ describe("Agent SDK app-server integration", () => {
       });
       expect(server.createdAgentPinGlobals).toEqual([false]);
     } finally {
-      agent.shutdown();
+      await agent.shutdown();
     }
   });
 
@@ -817,7 +975,7 @@ describe("Agent SDK app-server integration", () => {
       expect(server.createdAgentPinGlobals).toEqual([]);
       expect(server.updatedModelPayloads).toEqual([]);
     } finally {
-      agent.shutdown();
+      await agent.shutdown();
     }
   });
 
@@ -840,7 +998,7 @@ describe("Agent SDK app-server integration", () => {
 
       expect(server.closedSockets).toBeGreaterThan(closedBeforeReload);
     } finally {
-      agent.shutdown();
+      await agent.shutdown();
     }
   });
 
@@ -869,7 +1027,7 @@ describe("Agent SDK app-server integration", () => {
       expect(second.nextCursor).toBeUndefined();
       expect(server.conversationRetrieveIds).toHaveLength(51);
     } finally {
-      agent.shutdown();
+      await agent.shutdown();
       await rm(directory, { recursive: true, force: true });
     }
   });
@@ -898,7 +1056,7 @@ describe("Agent SDK app-server integration", () => {
         (await registry.list("agent-test", cwd)).map((record) => record.sessionId).sort(),
       ).toEqual(["conv-missing", "conv-visible"]);
     } finally {
-      agent.shutdown();
+      await agent.shutdown();
       await rm(directory, { recursive: true, force: true });
     }
   });
@@ -921,7 +1079,7 @@ describe("Agent SDK app-server integration", () => {
       ]);
       expect(new Set(server.runtimeStartRequestIds).size).toBe(3);
     } finally {
-      agent.shutdown();
+      await agent.shutdown();
     }
   });
 
@@ -956,15 +1114,15 @@ describe("Agent SDK app-server integration", () => {
           description: "Model used for this Letta session",
           category: "model",
           type: "select",
-          currentValue: "test-model",
+          currentValue: "test/model",
           options: [
             {
-              value: "test-model",
+              value: "test/model",
               name: "Test Model",
               description: "Deterministic test model",
             },
             {
-              value: "other-model",
+              value: "test/other-model",
               name: "Other Model",
               description: "Alternate deterministic model",
             },
@@ -972,7 +1130,7 @@ describe("Agent SDK app-server integration", () => {
         },
       ]);
     } finally {
-      agent.shutdown();
+      await agent.shutdown();
     }
   });
 
@@ -986,19 +1144,549 @@ describe("Agent SDK app-server integration", () => {
       const result = await agent.setSessionConfigOption({
         sessionId: session.sessionId,
         configId: "model",
-        value: "other-model",
+        value: "test/other-model",
       });
 
-      expect(server.updatedModelPayloads).toEqual([{ model_id: "other-model" }]);
+      expect(server.updatedModelPayloads).toEqual([{ model_id: "other-model", model_handle: "test/other-model" }]);
       expect(
         result.configOptions.find((option) => option.id === "model"),
       ).toMatchObject({
         id: "model",
         category: "model",
-        currentValue: "other-model",
+        currentValue: "test/other-model",
       });
     } finally {
-      agent.shutdown();
+      await agent.shutdown();
+    }
+  });
+
+  for (const legacyXhigh of [true, false]) test(`Anthropic disabled and max tiers survive updates and reload (legacy xhigh: ${legacyXhigh})`, async () => {
+    const server = new FakeAppServer();
+    server.reasoningModel = true;
+    server.anthropicReasoning = true;
+    server.legacyXhigh = legacyXhigh;
+    server.modelSettings = { effort: "high" };
+    const agent = createAgent(server);
+    const { context } = createContext();
+    try {
+      const { sessionId } = await openSession(agent, context);
+      for (const value of ["none", "max", "high"]) {
+        server.updateResponseSettings = {};
+        const result = await agent.setSessionConfigOption({ sessionId, configId: "reasoning_effort", value });
+        expect(result.configOptions.find((option) => option.id === "reasoning_effort"))
+          .toMatchObject({ currentValue: value });
+        const loaded = await agent.loadSession({ sessionId, cwd: "/tmp/letta-acp-test", mcpServers: [] }, context);
+        expect(loaded.configOptions?.find((option) => option.id === "reasoning_effort"))
+          .toMatchObject({ currentValue: value });
+      }
+      expect(server.updatedModelPayloads).toEqual([
+        { model_id: "test-none", model_handle: "test/model" },
+        { model_id: legacyXhigh ? "test-xhigh" : "test-max", model_handle: "test/model" },
+        { model_id: "test-high", model_handle: "test/model" },
+      ]);
+      server.updateResponseSettings = { effort: null };
+      const unknown = await agent.setSessionConfigOption({ sessionId, configId: "reasoning_effort", value: "none" });
+      expect(unknown.configOptions.find((option) => option.id === "reasoning_effort")).toBeUndefined();
+    } finally {
+      await agent.shutdown();
+    }
+  });
+
+  for (const api of ["mode", "config"]) test(`live ${api} change while approval is pending governs subsequent decisions`, async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server);
+    const { context, permissionRequests } = createContext();
+    let release!: () => void;
+    let requested!: () => void;
+    const pending = new Promise<void>((resolve) => { requested = resolve; });
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const request = context.request;
+    context.request = (async (...args: Parameters<typeof request>) => {
+      requested();
+      await gate;
+      return request(...args);
+    }) as typeof request;
+    try {
+      const { sessionId } = await openSession(agent, context);
+      const started = server.nextCancelablePrompt();
+      const prompt = agent.prompt({ sessionId, prompt: [{ type: "text", text: "cancel active prompt" }] }, context);
+      await started;
+      server.requestPermissionAfterPrompt({ requestId: "first" });
+      await pending;
+      if (api === "mode") await agent.setSessionMode({ sessionId, modeId: "unrestricted" }, context);
+      else await agent.setSessionConfigOption({ sessionId, configId: "permissions", value: "unrestricted" });
+      const approval = server.nextApprovalResponse();
+      server.requestPermissionAfterPrompt({ requestId: "second", toolCallId: "second-call" });
+      expect(await approval).toMatchObject({ request_id: "second", decision: { behavior: "allow" } });
+      expect(permissionRequests).toHaveLength(0);
+      release();
+      await prompt;
+    } finally {
+      release?.();
+      await agent.shutdown();
+    }
+  });
+
+  test.each(["litellm/xai/grok-4.7", "lc-openrouter/x-ai/grok-4.7"])(
+    "proxy requested efforts use the exact route and persist/reset through public SDK: %s", async (route) => {
+      const server = new FakeAppServer();
+      server.proxyRoute = route;
+      server.proxyPresetId = route.startsWith("litellm/") ? "inventory-proxy-preset" : undefined;
+      server.modelHandle = route;
+      server.contextWindow = 256_000;
+      server.unrelatedProxyReply = true;
+      const agent = createAgent(server);
+      const { context } = createContext();
+      try {
+        const { sessionId, configOptions } = await openSession(agent, context);
+        expect(configOptions?.find((option) => option.id === "requested_reasoning_effort"))
+          .toMatchObject({ name: "Requested reasoning effort", currentValue: "unknown" });
+        for (const value of ["high", "max", "default"]) {
+          const result = await agent.setSessionConfigOption({ sessionId, configId: "requested_reasoning_effort", value });
+          expect(server.updatedModelPayloads.at(-1)).toEqual({
+            model_id: server.proxyPresetId ?? route,
+            model_handle: route, reasoning_effort: value === "default" ? null : value,
+          });
+          expect(server.contextWindow).toBe(256_000);
+          expect(server.modelHandle).toBe(route);
+          expect(result.configOptions.find((option) => option.id === "requested_reasoning_effort"))
+            .toMatchObject({ currentValue: value });
+          const loaded = await agent.loadSession({ sessionId, cwd: "/tmp/letta-acp-test", mcpServers: [] }, context);
+          expect(loaded.configOptions?.find((option) => option.id === "requested_reasoning_effort"))
+            .toMatchObject({ currentValue: value });
+        }
+        for (const value of ["unknown", "ultra", null]) {
+          await expect(agent.setSessionConfigOption({
+            sessionId, configId: "requested_reasoning_effort", value: value as string,
+          })).rejects.toThrow("Unsupported requested effort");
+        }
+        expect(server.updatedModelPayloads).toHaveLength(3);
+      } finally {
+        await agent.shutdown();
+      }
+    },
+  );
+
+  test.each(["local", "cloud-oauth"] as const)(
+    "%s config gates raw proxy overrides independently of advertised proxy metadata", async (backend) => {
+      const server = new FakeAppServer();
+      server.proxyRoute = server.modelHandle = "litellm/xai/grok-4.7";
+      server.proxyPresetId = "inventory-proxy-preset";
+      server.contextWindow = 256_000;
+      server.modelSettings = { reasoning: null };
+      const config = configFromEnv({ LETTA_ACP_BACKEND: backend });
+      const agent = createAgent(server, {}, config.clientOptions);
+      const { context } = createContext();
+      try {
+        const { sessionId, configOptions } = await openSession(agent, context);
+        expect(configOptions?.some((option) => option.id === "requested_reasoning_effort"))
+          .toBe(backend === "cloud-oauth");
+        const state = (agent as unknown as {
+          sessions: Map<string, { session: LettaCodeSession }>;
+        }).sessions.get(sessionId)!;
+        const sendCommand = state.session.sendCommand.bind(state.session);
+        let commandCount = 0;
+        state.session.sendCommand = ((...args: Parameters<LettaCodeSession["sendCommand"]>) => {
+          commandCount++;
+          return sendCommand(...args);
+        }) as LettaCodeSession["sendCommand"];
+        const change = agent.setSessionConfigOption({
+          sessionId, configId: "requested_reasoning_effort", value: "high",
+        });
+        if (backend === "local") {
+          await expect(change).rejects.toThrow("Unsupported requested effort");
+          expect(commandCount).toBe(0);
+          expect(server.updatedModelPayloads).toEqual([]);
+          expect(server.modelSettings).toEqual({ reasoning: null });
+          expect(server.contextWindow).toBe(256_000);
+        } else {
+          await change;
+          expect(commandCount).toBeGreaterThan(0);
+          expect(server.updatedModelPayloads).toEqual([{
+            model_id: "inventory-proxy-preset", model_handle: server.proxyRoute, reasoning_effort: "high",
+          }]);
+        }
+      } finally {
+        await agent.shutdown();
+      }
+    },
+  );
+
+  test("proxy errors and malformed responses release the queue without claiming a new effort", async () => {
+    const server = new FakeAppServer();
+    server.proxyRoute = server.modelHandle = "litellm/xai/grok-4.7";
+    server.contextWindow = 256_000;
+    server.modelSettings = { reasoning: null };
+    const agent = createAgent(server);
+    const { context } = createContext();
+    try {
+      const { sessionId } = await openSession(agent, context);
+      for (const response of [
+        { success: false, error: "secret backend error" },
+        { type: "error", error: "secret protocol error" },
+        { success: true, model_handle: "wrong/route", model_settings: { reasoning: { reasoning_effort: "high" } } },
+        { success: true, model_handle: server.proxyRoute, model_settings: null },
+      ]) {
+        server.malformedProxyResponse = response;
+        await expect(agent.setSessionConfigOption({
+          sessionId, configId: "requested_reasoning_effort", value: "high",
+        })).rejects.toThrow("Letta requested effort update failed");
+        const loaded = await agent.loadSession({ sessionId, cwd: "/tmp/letta-acp-test", mcpServers: [] }, context);
+        expect(loaded.configOptions?.find((option) => option.id === "requested_reasoning_effort"))
+          .toMatchObject({ currentValue: "default" });
+      }
+      server.malformedProxyResponse = undefined;
+      await agent.setSessionConfigOption({ sessionId, configId: "requested_reasoning_effort", value: "max" });
+      expect(server.modelSettings).toMatchObject({ reasoning: { reasoning_effort: "max" } });
+    } finally {
+      await agent.shutdown();
+    }
+  });
+
+  test.each(["malformed", "normalized", "timeout", "cloud"] as const)(
+    "persisted proxy update with %s acknowledgement refreshes client state and releases queue", async (failure) => {
+      const server = new FakeAppServer();
+      server.proxyRoute = server.modelHandle = "litellm/xai/grok-4.7";
+      server.contextWindow = 256_000;
+      server.modelSettings = { reasoning: null };
+      const agent = createAgent(server);
+      const { context, updates } = createContext();
+      try {
+        const { sessionId } = await openSession(agent, context);
+        // Exercise the real SDK request timeout without waiting its production default.
+        const state = (agent as unknown as {
+          sessions: Map<string, { session: LettaCodeSession }>;
+        }).sessions.get(sessionId)!;
+        const sendCommand = state.session.sendCommand.bind(state.session);
+        state.session.sendCommand = ((command, options) =>
+          sendCommand(command, { ...options, timeoutMs: 30 })) as LettaCodeSession["sendCommand"];
+        if (failure === "malformed") server.persistedProxyResponse = {
+          model_settings: null, error: "secret backend credential",
+        };
+        if (failure === "normalized") server.normalizedProxyEffort = "low";
+        if (failure === "timeout") server.persistedProxyResponse = "timeout";
+        if (failure === "cloud") server.proxyCloud = true;
+        await expect(agent.setSessionConfigOption({
+          sessionId, configId: "requested_reasoning_effort", value: "high",
+        })).rejects.toThrow("Letta requested effort update failed");
+        const expected = failure === "normalized" ? "low" : failure === "cloud" ? "unknown" : "high";
+        const refresh = updates.filter((update) => update.sessionUpdate === "config_option_update").at(-1);
+        expect(refresh).toMatchObject({
+          configOptions: expect.arrayContaining([
+            expect.objectContaining({ id: "requested_reasoning_effort", currentValue: expected }),
+          ]),
+        });
+        expect(JSON.stringify(updates)).not.toContain("secret");
+        server.persistedProxyResponse = undefined;
+        server.normalizedProxyEffort = undefined;
+        server.proxyCloud = false;
+        const next = await agent.setSessionConfigOption({
+          sessionId, configId: "requested_reasoning_effort", value: "max",
+        });
+        expect(next.configOptions.find((option) => option.id === "requested_reasoning_effort"))
+          .toMatchObject({ currentValue: "max" });
+      } finally {
+        await agent.shutdown();
+      }
+    },
+  );
+
+  test("failed proxy state hydration never becomes default or retains a stale context", async () => {
+    const server = new FakeAppServer();
+    server.proxyRoute = server.modelHandle = "litellm/xai/grok-4.7";
+    server.contextWindow = 256_000;
+    server.modelSettings = { reasoning: null };
+    const agent = createAgent(server);
+    const { context } = createContext();
+    try {
+      const { sessionId } = await openSession(agent, context);
+      server.rejectModelState = true;
+      const result = await agent.setSessionConfigOption({
+        sessionId, configId: "requested_reasoning_effort", value: "high",
+      });
+      expect(result.configOptions.some((option) => option.id === "requested_reasoning_effort")).toBe(false);
+      await expect(agent.setSessionConfigOption({
+        sessionId, configId: "requested_reasoning_effort", value: "max",
+      })).rejects.toThrow("Unsupported requested effort");
+      server.rejectModelState = false;
+      const loaded = await agent.loadSession({ sessionId, cwd: "/tmp/letta-acp-test", mcpServers: [] }, context);
+      expect(loaded.configOptions?.find((option) => option.id === "requested_reasoning_effort"))
+        .toMatchObject({ currentValue: "high" });
+    } finally {
+      await agent.shutdown();
+    }
+  });
+
+  test("a proxy effort update blocks prompt startup and rejects new overrides during the prompt", async () => {
+    const server = new FakeAppServer();
+    server.proxyRoute = server.modelHandle = "litellm/xai/grok-4.7";
+    server.contextWindow = 256_000;
+    const agent = createAgent(server);
+    const { context } = createContext();
+    let release: (() => void) | undefined;
+    try {
+      const { sessionId } = await openSession(agent, context);
+      const paused = server.pauseNextModelUpdate();
+      const change = agent.setSessionConfigOption({ sessionId, configId: "requested_reasoning_effort", value: "high" });
+      await paused.received;
+      release = paused.release;
+      const prompt = agent.prompt({ sessionId, prompt: [{ type: "text", text: "hello" }] }, context);
+      await expect(agent.setSessionConfigOption({
+        sessionId, configId: "requested_reasoning_effort", value: "max",
+      })).rejects.toThrow("Cannot change configuration during a prompt");
+      expect(server.inputModels).toEqual([]);
+      release();
+      await change;
+      await prompt;
+      expect(server.inputModels).toEqual([server.proxyRoute]);
+    } finally {
+      release?.();
+      await agent.shutdown();
+    }
+  });
+
+  test("unmarked proxy-looking routes do not get a requested-effort override", async () => {
+    const server = new FakeAppServer();
+    server.proxyRoute = server.modelHandle = "lc-openrouter/x-ai/grok-4.7";
+    server.proxyMarked = false;
+    server.contextWindow = 256_000;
+    const agent = createAgent(server);
+    const { context } = createContext();
+    try {
+      const { sessionId, configOptions } = await openSession(agent, context);
+      expect(configOptions?.some((option) => option.id === "requested_reasoning_effort")).toBe(false);
+      await expect(agent.setSessionConfigOption({
+        sessionId, configId: "requested_reasoning_effort", value: "high",
+      })).rejects.toThrow("Unsupported requested effort");
+      expect(server.updatedModelPayloads).toEqual([]);
+    } finally {
+      await agent.shutdown();
+    }
+  });
+
+  test("true local config still hydrates, persists and reloads catalog-backed reasoning through the SDK", async () => {
+    const server = new FakeAppServer();
+    server.reasoningModel = true;
+    server.modelSettings = { reasoning: { reasoning_effort: "high" } };
+    const agent = createAgent(server, {}, configFromEnv({ LETTA_ACP_BACKEND: "local" }).clientOptions);
+    const { context, updates } = createContext();
+    try {
+      const session = await openSession(agent, context);
+      expect(session.configOptions?.find((option) => option.id === "reasoning_effort"))
+        .toMatchObject({ category: "thought_level", currentValue: "high" });
+      expect(session.configOptions?.find((option) => option.id === "model"))
+        .toMatchObject({
+          currentValue: "test/model",
+          options: [
+            expect.objectContaining({ value: "test/model", name: "Test Model" }),
+            expect.objectContaining({ value: "test/other-model" }),
+          ],
+        });
+      await agent.setSessionConfigOption({
+        sessionId: session.sessionId, configId: "model", value: "test/model",
+      });
+      expect(server.updatedModelPayloads).toEqual([]);
+      const result = await agent.setSessionConfigOption({
+        sessionId: session.sessionId, configId: "reasoning_effort", value: "low",
+      });
+      expect(server.updatedModelPayloads).toEqual([
+        { model_id: "test-low", model_handle: "test/model" },
+      ]);
+      expect(result.configOptions.find((option) => option.id === "reasoning_effort"))
+        .toMatchObject({ currentValue: "low" });
+      expect(result.configOptions.find((option) => option.id === "model"))
+        .toMatchObject({ currentValue: "test/model" });
+      const loaded = await agent.loadSession({
+        sessionId: session.sessionId, cwd: "/tmp/letta-acp-test", mcpServers: [],
+      }, context);
+      expect(loaded.configOptions?.find((option) => option.id === "reasoning_effort"))
+        .toMatchObject({ currentValue: "low" });
+      await agent.prompt({
+        sessionId: session.sessionId, prompt: [{ type: "text", text: "/model other-model" }],
+      }, context);
+      const snapshot = [...updates].reverse().find((update) => update.sessionUpdate === "config_option_update");
+      expect(snapshot).toBeDefined();
+      expect(snapshot?.configOptions).not.toContainEqual(expect.objectContaining({ id: "reasoning_effort" }));
+    } finally {
+      await agent.shutdown();
+    }
+  });
+
+  test("rejects unsupported effort and preserves confirmed state after runtime errors", async () => {
+    const server = new FakeAppServer();
+    server.reasoningModel = true;
+    server.modelSettings = { effort: "high" };
+    const agent = createAgent(server);
+    const { context } = createContext();
+    try {
+      const session = await openSession(agent, context);
+      for (const value of ["medium", "max", "bogus"]) {
+        await expect(agent.setSessionConfigOption({
+          sessionId: session.sessionId, configId: "reasoning_effort", value,
+        })).rejects.toThrow("Unsupported reasoning effort");
+      }
+      expect(server.updatedModelPayloads).toEqual([]);
+      server.rejectModelUpdate = true;
+      await expect(agent.setSessionConfigOption({
+        sessionId: session.sessionId, configId: "reasoning_effort", value: "low",
+      })).rejects.toThrow("Letta model update failed");
+      const snapshot = await agent.setSessionConfigOption({
+        sessionId: session.sessionId, configId: "permissions", value: "standard",
+      });
+      expect(snapshot.configOptions.find((option) => option.id === "reasoning_effort"))
+        .toMatchObject({ currentValue: "high" });
+    } finally {
+      await agent.shutdown();
+    }
+  });
+
+  test("omits unknown effort until an explicit model preset confirms a tier", async () => {
+    const server = new FakeAppServer();
+    server.reasoningModel = true;
+    const agent = createAgent(server);
+    const { context } = createContext();
+    try {
+      const session = await openSession(agent, context);
+      expect(session.configOptions?.some((option) => option.id === "reasoning_effort")).toBe(false);
+      const selected = await agent.setSessionConfigOption({
+        sessionId: session.sessionId, configId: "model", value: "test-high",
+      });
+      expect(selected.configOptions.find((option) => option.id === "reasoning_effort"))
+        .toMatchObject({ currentValue: "high", category: "thought_level" });
+    } finally {
+      await agent.shutdown();
+    }
+  });
+
+  test("serializes overlapping model and effort updates and reuses the pre-update catalog", async () => {
+    const server = new FakeAppServer();
+    server.reasoningModel = true;
+    server.alternateReasoning = true;
+    server.modelSettings = { effort: "high" };
+    server.contextWindow = 100_000;
+    const agent = createAgent(server);
+    const { context } = createContext();
+    try {
+      const { sessionId } = await openSession(agent, context);
+      const gate = server.pauseNextModelUpdate();
+      const model = agent.setSessionConfigOption({ sessionId, configId: "model", value: "other-high" });
+      await gate.received;
+      const effort = agent.setSessionConfigOption({ sessionId, configId: "reasoning_effort", value: "low" });
+      server.rejectCatalog = true;
+      gate.release();
+      await model;
+      const result = await effort;
+      expect(server.updatedModelPayloads).toEqual([
+        { model_id: "other-high" },
+        { model_id: "other-low", model_handle: "test/other-model" },
+      ]);
+      expect(result.configOptions.find((option) => option.id === "model"))
+        .toMatchObject({ currentValue: "test/other-model" });
+      expect(result.configOptions.find((option) => option.id === "reasoning_effort"))
+        .toMatchObject({ currentValue: "low" });
+      expect(server.catalogRequests).toBe(1);
+    } finally {
+      await agent.shutdown();
+    }
+  });
+
+  test("prompt waits for admitted changes, rejects new changes, and slash model does not deadlock", async () => {
+    const server = new FakeAppServer();
+    server.reasoningModel = true;
+    server.modelSettings = { effort: "high" };
+    const agent = createAgent(server);
+    const { context, updates } = createContext();
+    try {
+      const { sessionId } = await openSession(agent, context);
+      const gate = server.pauseNextModelUpdate();
+      const change = agent.setSessionConfigOption({ sessionId, configId: "model", value: "test-low" });
+      await gate.received;
+      const prompt = agent.prompt({ sessionId, prompt: [{ type: "text", text: "/model test-high" }] }, context);
+      await expect(agent.setSessionConfigOption({ sessionId, configId: "reasoning_effort", value: "low" }))
+        .rejects.toThrow("Cannot change configuration during a prompt");
+      await expect(agent.setSessionMode({ sessionId, modeId: "unrestricted" }, context))
+        .resolves.toEqual({});
+      await expect(agent.setSessionConfigOption({ sessionId, configId: "permissions", value: "standard" }))
+        .resolves.toHaveProperty("configOptions");
+      await expect(agent.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] }, context))
+        .rejects.toThrow("already active");
+      expect(server.updatedModelPayloads).toEqual([]);
+      gate.release();
+      await change;
+      await expect(prompt).resolves.toEqual({ stopReason: "end_turn" });
+      expect(server.updatedModelPayloads).toEqual([{ model_id: "test-low" }, { model_id: "test-high" }]);
+      const snapshot = [...updates].reverse().find((update) => update.sessionUpdate === "config_option_update");
+      expect(snapshot?.configOptions).toContainEqual(expect.objectContaining({ id: "reasoning_effort", currentValue: "high" }));
+      await agent.setSessionConfigOption({ sessionId, configId: "reasoning_effort", value: "low" });
+    } finally {
+      await agent.shutdown();
+    }
+  });
+
+  test("a normal prompt sends only after an in-flight model update has completed", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server);
+    const { context } = createContext();
+    try {
+      const { sessionId } = await openSession(agent, context);
+      const gate = server.pauseNextModelUpdate();
+      const change = agent.setSessionConfigOption({ sessionId, configId: "model", value: "other-model" });
+      await gate.received;
+      const prompt = agent.prompt({ sessionId, prompt: [{ type: "text", text: "hello" }] }, context);
+      expect(server.inputModels).toEqual([]);
+      await expect(agent.setSessionConfigOption({ sessionId, configId: "model", value: "test-model" }))
+        .rejects.toThrow("during a prompt");
+      gate.release();
+      await change;
+      await prompt;
+      expect(server.inputModels).toEqual(["test/other-model"]);
+    } finally {
+      await agent.shutdown();
+    }
+  });
+
+  test("failed queued update does not poison the next update or prompt", async () => {
+    const server = new FakeAppServer();
+    server.reasoningModel = true;
+    const agent = createAgent(server);
+    const { context } = createContext();
+    try {
+      const { sessionId } = await openSession(agent, context);
+      const gate = server.pauseNextModelUpdate();
+      server.rejectModelUpdate = true;
+      const failed = agent.setSessionConfigOption({ sessionId, configId: "model", value: "test-low" });
+      const rejection = expect(failed).rejects.toThrow("Letta model update failed");
+      await gate.received;
+      const next = agent.setSessionConfigOption({ sessionId, configId: "model", value: "test-high" });
+      gate.release();
+      server.rejectModelUpdate = false;
+      await rejection;
+      await next;
+      await expect(agent.prompt({ sessionId, prompt: [{ type: "text", text: "/model" }] }, context))
+        .resolves.toEqual({ stopReason: "end_turn" });
+    } finally {
+      await agent.shutdown();
+    }
+  });
+
+  test("canonicalizes persisted preset ids and uses runtime context rather than preset limits", async () => {
+    const server = new FakeAppServer();
+    server.reasoningModel = true;
+    server.alternateReasoning = true;
+    server.alternateWindows = true;
+    server.modelHandle = "test-high";
+    server.modelSettings = { effort: "high" };
+    const agent = createAgent(server);
+    const { context } = createContext();
+    try {
+      const { sessionId } = await openSession(agent, context);
+      await agent.setSessionConfigOption({ sessionId, configId: "reasoning_effort", value: "low" });
+      expect(server.updatedModelPayloads[0]).toEqual({ model_id: "test-low", model_handle: "test/model" });
+      server.contextWindow = 42_000;
+      const result = await agent.setSessionConfigOption({ sessionId, configId: "model", value: "other-high" });
+      expect(result.configOptions.find((option) => option.id === "reasoning_effort")).toBeUndefined();
+    } finally {
+      await agent.shutdown();
     }
   });
 
@@ -1036,7 +1724,7 @@ describe("Agent SDK app-server integration", () => {
       });
       expect(permissionRequests).toEqual([]);
     } finally {
-      agent.shutdown();
+      await agent.shutdown();
     }
   });
 
@@ -1061,7 +1749,7 @@ describe("Agent SDK app-server integration", () => {
         content: { type: "text", text: "PROMPT_OK" },
       });
     } finally {
-      agent.shutdown();
+      await agent.shutdown();
     }
   });
 
@@ -1119,7 +1807,7 @@ describe("Agent SDK app-server integration", () => {
         },
       ]);
     } finally {
-      agent.shutdown();
+      await agent.shutdown();
     }
   });
 
@@ -1209,7 +1897,7 @@ describe("Agent SDK app-server integration", () => {
         },
       ]);
     } finally {
-      agent.shutdown();
+      await agent.shutdown();
     }
   });
 
@@ -1261,7 +1949,7 @@ describe("Agent SDK app-server integration", () => {
       );
       expect(completed).not.toHaveProperty("content");
     } finally {
-      agent.shutdown();
+      await agent.shutdown();
     }
   });
 
@@ -1302,7 +1990,7 @@ describe("Agent SDK app-server integration", () => {
       // Out-of-turn requests carry a deadline the client can observe.
       expect(permissionSignals.at(-1)).toBeInstanceOf(AbortSignal);
     } finally {
-      agent.shutdown();
+      await agent.shutdown();
     }
   });
 
@@ -1336,7 +2024,7 @@ describe("Agent SDK app-server integration", () => {
       );
       expect(permissionRequests).toEqual([]);
     } finally {
-      agent.shutdown();
+      await agent.shutdown();
     }
   });
 
@@ -1425,7 +2113,7 @@ describe("Agent SDK app-server integration", () => {
       });
       expect(permissionRequests).toHaveLength(requestCount);
     } finally {
-      agent.shutdown();
+      await agent.shutdown();
       await rm(root, { recursive: true, force: true });
     }
   });
@@ -1483,7 +2171,7 @@ describe("Agent SDK app-server integration", () => {
       await secondApproval;
       expect(permissionRequests).toHaveLength(2);
     } finally {
-      agent.shutdown();
+      await agent.shutdown();
       await rm(root, { recursive: true, force: true });
     }
   });
@@ -1526,7 +2214,7 @@ describe("Agent SDK app-server integration", () => {
         }),
       );
     } finally {
-      agent.shutdown();
+      await agent.shutdown();
     }
   });
 
@@ -1561,7 +2249,7 @@ describe("Agent SDK app-server integration", () => {
       // The user already pressed stop; they should not be asked again.
       expect(permissionRequests).toEqual([]);
     } finally {
-      agent.shutdown();
+      await agent.shutdown();
     }
   });
 
@@ -1598,7 +2286,7 @@ describe("Agent SDK app-server integration", () => {
       );
       expect(permissionSignals.at(-1)?.aborted).toBe(true);
     } finally {
-      agent.shutdown();
+      await agent.shutdown();
     }
   });
 
@@ -1626,7 +2314,7 @@ describe("Agent SDK app-server integration", () => {
         content: { type: "text", text: "STILL_WORKING" },
       });
     } finally {
-      agent.shutdown();
+      await agent.shutdown();
     }
   });
 
@@ -1649,7 +2337,7 @@ describe("Agent SDK app-server integration", () => {
 
       expect(result).toEqual({ stopReason: "end_turn" });
     } finally {
-      agent.shutdown();
+      await agent.shutdown();
     }
   });
 
@@ -1698,7 +2386,7 @@ describe("Agent SDK app-server integration", () => {
         content: { type: "text", text: "APPROVAL_OK" },
       });
     } finally {
-      agent.shutdown();
+      await agent.shutdown();
     }
   });
 
@@ -1733,7 +2421,7 @@ describe("Agent SDK app-server integration", () => {
         content: { type: "text", text: "COMMAND_APPROVAL_OK" },
       });
     } finally {
-      agent.shutdown();
+      await agent.shutdown();
     }
   });
 
@@ -1771,7 +2459,7 @@ describe("Agent SDK app-server integration", () => {
         content: { type: "text", text: "REPLACEMENT_OK" },
       });
     } finally {
-      agent.shutdown();
+      await agent.shutdown();
     }
   });
 
@@ -1795,7 +2483,7 @@ describe("Agent SDK app-server integration", () => {
 
       expect(await prompt).toEqual({ stopReason: "cancelled" });
     } finally {
-      agent.shutdown();
+      await agent.shutdown();
     }
   });
 });

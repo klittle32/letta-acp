@@ -37,6 +37,7 @@
     "test:acpx": "bun test test/acpx-client.test.ts",
     "test:backend:live:local": "bun test/backend-live.ts local",
     "test:backend:live:cloud": "bun test/backend-live.ts cloud",
+    "test:backend:live:cloud-oauth": "node test/backend-cloud-oauth-live.mjs",
     "test:client": "bun test-client.ts",
     "check": "bun run test && bun run typecheck && bun run build"
   },
