@@ -24,16 +24,18 @@ describe("SessionRegistry", () => {
   test("persists project-scoped sessions across adapter processes", async () => {
     const directory = await temporaryDirectory();
     const first = new SessionRegistry(directory, "cloud");
-    await first.record("agent-1", "conv-one", "/workspace/one");
-    await first.record("agent-1", "conv-two", "/workspace/two");
-    await first.record("agent-2", "conv-other-agent", "/workspace/one");
+    const firstProject = join(directory, "workspace", "one");
+    const secondProject = join(directory, "workspace", "two");
+    await first.record("agent-1", "conv-one", firstProject);
+    await first.record("agent-1", "conv-two", secondProject);
+    await first.record("agent-2", "conv-other-agent", firstProject);
 
     const restarted = new SessionRegistry(directory, "cloud");
-    expect(await restarted.list("agent-1", "/workspace/one")).toEqual([
+    expect(await restarted.list("agent-1", firstProject)).toEqual([
       expect.objectContaining({
         agentId: "agent-1",
         sessionId: "conv-one",
-        cwd: "/workspace/one",
+        cwd: firstProject,
       }),
     ]);
   });

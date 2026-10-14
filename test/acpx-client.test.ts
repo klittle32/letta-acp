@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SessionRegistry } from "../src/session-registry.js";
@@ -181,15 +181,20 @@ async function runAcpx(
 
   const acpxPath = join(import.meta.dir, "..", "node_modules", ".bin", "acpx");
   const agentPath = join(import.meta.dir, "..", "src", "index.ts");
+  mkdirSync(join(home, ".acpx"), { recursive: true });
+  writeFileSync(join(home, ".acpx", "config.json"), JSON.stringify({
+    agents: {
+      "test-adapter": { argv: [process.execPath, agentPath] },
+    },
+  }));
   const child = Bun.spawn(
     [
       acpxPath,
-      "--agent",
-      `${process.execPath} ${agentPath}`,
       "--format",
       format,
       "--timeout",
       "5",
+      "test-adapter",
       ...command,
     ],
     {
@@ -197,6 +202,7 @@ async function runAcpx(
       env: {
         ...process.env,
         HOME: home,
+        USERPROFILE: home,
         LETTA_ACP_BACKEND: "remote",
         LETTA_APP_SERVER_URL: appServerUrl,
         LETTA_AGENT_ID: TEST_RUNTIME.agent_id,
@@ -230,6 +236,7 @@ async function verifyMcpShutdownOnClientDisconnect(): Promise<void> {
     env: {
       ...process.env,
       HOME: home,
+      USERPROFILE: home,
       LETTA_ACP_BACKEND: "remote",
       LETTA_APP_SERVER_URL: appServerUrl,
       LETTA_AGENT_ID: TEST_RUNTIME.agent_id,
@@ -292,6 +299,8 @@ async function verifyMcpShutdownOnClientDisconnect(): Promise<void> {
     }
     expect(sessionOpened).toBe(true);
     expect(existsSync(pidFile)).toBe(true);
+    const mcpPid = Number(readFileSync(pidFile, "utf8"));
+    expect(Number.isInteger(mcpPid) && mcpPid > 0).toBe(true);
 
     child.stdin.end();
     const exitCode = await Promise.race([
@@ -301,7 +310,20 @@ async function verifyMcpShutdownOnClientDisconnect(): Promise<void> {
       }),
     ]);
     expect(exitCode).toBe(0);
-    expect(existsSync(marker)).toBe(true);
+    // Windows forcibly terminates on SIGTERM without running the JS handler.
+    // Verify cleanup directly there; POSIX also verifies the handler ran.
+    if (process.platform === "win32") {
+      let processExists = true;
+      try {
+        process.kill(mcpPid, 0);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+        processExists = false;
+      }
+      expect(processExists).toBe(false);
+    } else {
+      expect(existsSync(marker)).toBe(true);
+    }
   } finally {
     if (child.exitCode === null) child.kill();
     if (existsSync(pidFile) && !existsSync(marker)) {
@@ -343,9 +365,11 @@ describe("acpx client compatibility", () => {
       true,
     );
 
-    expect(stdout).toContain(TEST_RUNTIME.conversation_id);
-    expect(stdout).toContain("ACP client compatibility session");
-    expect(stdout).toContain(cwd);
+    expect(JSON.parse(stdout).sessions).toContainEqual(expect.objectContaining({
+      sessionId: TEST_RUNTIME.conversation_id,
+      title: "ACP client compatibility session",
+      cwd,
+    }));
   }, 10_000);
 
   test("waits for MCP subprocess cleanup after the client disconnects", async () => {
