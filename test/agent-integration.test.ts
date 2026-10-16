@@ -52,7 +52,34 @@ class FakeAppServer {
   unrelatedProxyReply = false;
   rejectModelState = false;
   malformedProxyResponse: WireMessage | undefined;
+  /** Realistic Letta grid: one route, 350K/950K presets x six efforts. */
+  lunaCatalog = false;
+  /** Make the 950K presets differ beyond context_window. */
+  lunaDivergent = false;
+  /** Letta's live sparse shape: Opus 5 offers 950K only at high. */
+  opusCatalog = false;
+  /** Runtime preservation heuristic: a preset update keeps the old window. */
+  preserveWindow = false;
+  defaultConversation = false;
+  agentModel = "test/model";
+  agentSettings: WireMessage = {};
+  agentContextWindow: number | undefined;
+  readonly contextUpdates: Array<{ scope: "agent" | "conversation"; body: WireMessage }> = [];
+  rejectContextUpdate = false;
+  ignoreContextUpdate = false;
   private pausedUpdate: ((resume: () => void) => void) | undefined;
+  private pausedRetrieve: ((resume: () => void) => void) | undefined;
+
+  pauseNextAgentRetrieve() {
+    let release!: () => void;
+    let started!: () => void;
+    const received = new Promise<void>((resolve) => { started = resolve; });
+    this.pausedRetrieve = (resume) => {
+      release = resume;
+      started();
+    };
+    return { received, release: () => release() };
+  }
 
   pauseNextModelUpdate() {
     let release!: () => void;
@@ -183,7 +210,13 @@ class FakeAppServer {
     if (socket.channel !== "control") {
       throw new Error(`Unexpected command on ${socket.channel} channel`);
     }
-    if (message.type === "update_model" && this.pausedUpdate) {
+    if (message.type === "agent_retrieve" && this.pausedRetrieve) {
+      const pause = this.pausedRetrieve;
+      this.pausedRetrieve = undefined;
+      pause(() => this.receive(socket, message));
+      return;
+    }
+    if ((message.type === "update_model" || message.type === "conversation_update") && this.pausedUpdate) {
       const pause = this.pausedUpdate;
       this.pausedUpdate = undefined;
       pause(() => this.receive(socket, message));
@@ -193,7 +226,7 @@ class FakeAppServer {
     switch (message.type) {
       case "runtime_start": {
         const requestId = requiredString(message.request_id, "runtime_start.request_id");
-        const conversationId = `conv-test-${++this.nextConversation}`;
+        const conversationId = this.defaultConversation ? "default" : `conv-test-${++this.nextConversation}`;
         const createAgent = message.create_agent as
           | { body?: WireMessage; pin_global?: boolean }
           | undefined;
@@ -235,9 +268,36 @@ class FakeAppServer {
           type: "agent_retrieve_response",
           request_id: message.request_id,
           success: true,
-          agent: { id: "agent-test", model: "test/model", model_settings: {} },
+          agent: {
+            id: "agent-test", model: this.agentModel, model_settings: this.agentSettings,
+            context_window_limit: this.agentContextWindow,
+          },
         });
         return;
+      case "agent_update":
+      case "conversation_update": {
+        const scope = message.type === "agent_update" ? "agent" : "conversation";
+        const body = message.body as WireMessage;
+        this.contextUpdates.push({ scope, body });
+        if (this.rejectContextUpdate) {
+          socket.push({
+            type: `${message.type}_response`, request_id: message.request_id,
+            success: false, error: "secret backend credential",
+          });
+          return;
+        }
+        if (typeof body.context_window_limit === "number" && !this.ignoreContextUpdate) {
+          if (scope === "agent") this.agentContextWindow = body.context_window_limit;
+          else this.contextWindow = body.context_window_limit;
+        }
+        socket.push({
+          type: `${message.type}_response`, request_id: message.request_id, success: true,
+          ...(scope === "agent"
+            ? { agent: { id: "agent-test", model: this.agentModel, context_window_limit: this.agentContextWindow } }
+            : { conversation: { id: message.conversation_id, agent_id: "agent-test", context_window_limit: this.contextWindow } }),
+        });
+        return;
+      }
       case "conversation_retrieve": {
         const conversationId = requiredString(
           message.conversation_id,
@@ -343,6 +403,28 @@ class FakeAppServer {
               description: "",
               updateArgs: { reasoning_effort: effort, context_window: 100_000 },
             })) : []),
+            ...(this.lunaCatalog ? [350_000, 950_000].flatMap((window) =>
+              ["none", "low", "medium", "high", "xhigh", "max"].map((effort) => ({
+                id: `luna${window === 950_000 ? "-1m" : ""}-${effort}`,
+                handle: "chatgpt-plus-pro/gpt-6-luna",
+                label: window === 950_000 ? "GPT-6 Luna 1M" : "GPT-6 Luna",
+                description: "",
+                updateArgs: {
+                  reasoning_effort: effort,
+                  verbosity: this.lunaDivergent && window === 950_000 ? "medium" : "low",
+                  parallel_tool_calls: true, context_window: window, max_output_tokens: 128_000,
+                },
+              }))) : []),
+            ...(this.opusCatalog ? [
+              ...["low", "medium", "high", "xhigh", "max"].map((effort) => ({ id: `opus-5-${effort}`, effort, window: 200_000 })),
+              { id: "opus-5-1m", effort: "high", window: 950_000 },
+            ].map(({ id, effort, window }) => ({
+              id, handle: "anthropic/claude-opus-5", label: window > 200_000 ? "Opus 5 1M" : "Opus 5", description: "",
+              updateArgs: {
+                provider_type: "anthropic", reasoning_effort: effort, enable_reasoner: true,
+                context_window: window, max_output_tokens: 128_000,
+              },
+            })) : []),
             ...(this.alternateWindows ? [{
               id: "other-high-large",
               handle: "test/other-model",
@@ -393,8 +475,21 @@ class FakeAppServer {
         const handle =
           modelHandle ??
           (modelId.startsWith("other-") ? "test/other-model" : "test/model");
-        this.modelHandle = handle;
-        this.modelSettings = /^(test|other)-(low|high)$/.test(modelId)
+        const luna = this.lunaCatalog ? /^luna(-1m)?-(\w+)$/.exec(modelId) : null;
+        const opus = this.opusCatalog ? /^opus-5-(\w+)$/.exec(modelId) : null;
+        if (opus) {
+          this.modelHandle = handle;
+          this.modelSettings = { provider_type: "anthropic", effort: opus[1] === "1m" ? "high" : opus[1] };
+          if (!this.preserveWindow) this.contextWindow = opus[1] === "1m" ? 950_000 : 200_000;
+        } else if (luna && !this.preserveWindow) {
+          // A same-window preset leaves the window as is; otherwise it applies its own.
+          if (this.defaultConversation) this.agentContextWindow = luna[1] ? 950_000 : 350_000;
+          else this.contextWindow = luna[1] ? 950_000 : 350_000;
+        }
+        if (!opus) this.modelHandle = handle;
+        if (!opus) this.modelSettings = luna
+          ? { provider_type: "chatgpt_oauth", reasoning: { reasoning_effort: luna[2] } }
+          : /^(test|other)-(low|high)$/.test(modelId)
           ? { provider_type: "openai", reasoning: { reasoning_effort: modelId.split("-")[1] } }
           : {};
         if (this.anthropicReasoning) {
@@ -402,6 +497,10 @@ class FakeAppServer {
           this.modelSettings = effort === "none"
             ? { provider_type: "anthropic", thinking: { type: "disabled" } }
             : { provider_type: "anthropic", effort: effort === "xhigh" ? "max" : effort };
+        }
+        if (this.defaultConversation) {
+          this.agentModel = handle;
+          this.agentSettings = this.modelSettings;
         }
         // models2 lacks the flag even though list_models decorates its entry.
         // ID resolution merges native inventory locally; handle-only resolution
@@ -1134,6 +1233,29 @@ describe("Agent SDK app-server integration", () => {
     }
   });
 
+  test("an off-catalog current route is listed first with a distinct (current) name", async () => {
+    const server = new FakeAppServer();
+    server.modelHandle = "lc-custom/unlisted-model";
+    const agent = createAgent(server);
+    const { context } = createContext();
+    try {
+      const session = await openSession(agent, context);
+      const model = session.configOptions?.find((option) => option.id === "model") as
+        { currentValue: string; options: Array<{ value: string; name: string }> } | undefined;
+      expect(model?.currentValue).toBe("lc-custom/unlisted-model");
+      expect(model?.options[0]).toEqual({ value: "lc-custom/unlisted-model", name: "lc-custom/unlisted-model (current)" });
+      for (const option of model?.options ?? []) {
+        expect(option.name.trim()).not.toBe("");
+        expect(option.name).not.toBe(option.value);
+      }
+      // The value stays the exact route: reselecting it is a no-op.
+      await agent.setSessionConfigOption({ sessionId: session.sessionId, configId: "model", value: "lc-custom/unlisted-model" });
+      expect(server.updatedModelPayloads).toEqual([]);
+    } finally {
+      await agent.shutdown();
+    }
+  });
+
   test("switches models through session configuration options", async () => {
     const server = new FakeAppServer();
     const agent = createAgent(server);
@@ -1684,10 +1806,525 @@ describe("Agent SDK app-server integration", () => {
       expect(server.updatedModelPayloads[0]).toEqual({ model_id: "test-low", model_handle: "test/model" });
       server.contextWindow = 42_000;
       const result = await agent.setSessionConfigOption({ sessionId, configId: "model", value: "other-high" });
-      expect(result.configOptions.find((option) => option.id === "reasoning_effort")).toBeUndefined();
+      // This route's presets are sparse (no low at 200K): one selector lists
+      // only real presets, beside the runtime-reported off-grid state.
+      expect(result.configOptions.some((option) => ["reasoning_effort", "context_window"].includes(option.id))).toBe(false);
+      expect(result.configOptions.find((option) => option.id === "letta_preset")).toMatchObject({
+        currentValue: "current",
+        options: [
+          { value: "current", name: "high · 42K tokens (current, not a Letta preset)" },
+          { value: "other-low", name: "low · 100K tokens" },
+          { value: "other-high", name: "high · 100K tokens" },
+          { value: "other-high-large", name: "high · 200K tokens" },
+        ],
+      });
     } finally {
       await agent.shutdown();
     }
+  });
+
+  describe("Letta preset grid: separate effort and context size", () => {
+    const LUNA = "chatgpt-plus-pro/gpt-6-luna";
+    const ALL_EFFORTS = ["none", "low", "medium", "high", "xhigh", "max"];
+    type Options = Array<{ id: string; currentValue?: unknown; options?: unknown }> | undefined | null;
+    const find = (options: Options, id: string) => options?.find((option) => option.id === id) as
+      | { currentValue: string; description?: string; options: Array<{ value: string; name: string }> }
+      | undefined;
+    const values = (options: Options, id: string) => find(options, id)?.options.map((option) => option.value);
+
+    function lunaServer(effort: string, window: number) {
+      const server = new FakeAppServer();
+      server.lunaCatalog = true;
+      server.modelHandle = LUNA;
+      server.modelSettings = { provider_type: "chatgpt_oauth", reasoning: { reasoning_effort: effort } };
+      server.contextWindow = window;
+      return server;
+    }
+
+    /**
+     * T3's send path, from its installed source: model first, then the stored
+     * selections in option order, each checked against ONE options snapshot
+     * (values missing from it are skipped), skipping values whose live
+     * currentValue already matches; rejections are only logged.
+     */
+    async function t3Send(
+      agent: LettaAcpAgent, sessionId: string, snapshot: Options,
+      selections: Array<{ id: string; value: string }>,
+    ) {
+      const order = (snapshot ?? []).map((option) => option.id);
+      const ordered = [...selections].sort((a, b) => order.indexOf(a.id) - order.indexOf(b.id));
+      let live = snapshot;
+      const rejected: unknown[] = [];
+      for (const selection of ordered) {
+        const option = find(snapshot, selection.id);
+        if (!option?.options.some((choice) => choice.value === selection.value)) continue;
+        if (find(live, selection.id)?.currentValue === selection.value) continue;
+        try {
+          live = (await agent.setSessionConfigOption({ sessionId, configId: selection.id, value: selection.value })).configOptions;
+        } catch (error) {
+          rejected.push(error);
+        }
+      }
+      return { live, rejected };
+    }
+    const ids = (options: Options) => options?.map((option) => option.id);
+
+    test("off-grid 1.05M shows the true state beside every preset choice and writes nothing until chosen", async () => {
+      const server = lunaServer("low", 1_050_000);
+      const agent = createAgent(server);
+      const { context } = createContext();
+      try {
+        const { sessionId, configOptions } = await openSession(agent, context);
+        expect(ids(configOptions)).toEqual(["permissions", "model", "context_window", "reasoning_effort"]);
+        expect(find(configOptions, "model")).toMatchObject({ currentValue: LUNA });
+        expect(find(configOptions, "model")?.options[0]).toEqual({ value: LUNA, name: "GPT-6 Luna" });
+        expect(find(configOptions, "model")?.options.filter((option) => option.value === LUNA)).toHaveLength(1);
+        expect(find(configOptions, "context_window")).toMatchObject({
+          category: "model_config",
+          currentValue: "1050000",
+          options: [
+            { value: "350000", name: "350K tokens" },
+            { value: "950000", name: "950K tokens" },
+            { value: "1050000", name: "1.05M tokens (current, not a Letta preset)" },
+          ],
+        });
+        expect(find(configOptions, "reasoning_effort")).toMatchObject({
+          category: "thought_level",
+          currentValue: "low",
+          description: expect.stringContaining("moves the context size to that preset's window"),
+          options: ALL_EFFORTS.map((value) => ({ value, name: value })),
+        });
+        for (const [configId, value] of [["reasoning_effort", "low"], ["context_window", "1050000"], ["model", LUNA]]) {
+          await agent.setSessionConfigOption({ sessionId, configId: configId!, value: value! });
+        }
+        for (const value of ["ultra", "unknown", "minimal"]) {
+          await expect(agent.setSessionConfigOption({ sessionId, configId: "reasoning_effort", value }))
+            .rejects.toThrow("Unsupported reasoning effort");
+        }
+        for (const value of ["123456", "1050001", "custom", "0", ""]) {
+          await expect(agent.setSessionConfigOption({ sessionId, configId: "context_window", value }))
+            .rejects.toThrow("Unsupported context size");
+        }
+        await expect(agent.setSessionConfigOption({ sessionId, configId: "letta_preset", value: "luna-high" }))
+          .rejects.toThrow("Unsupported Letta preset");
+        expect(server.updatedModelPayloads).toEqual([]);
+        expect(server.contextUpdates).toEqual([]);
+        expect(server.contextWindow).toBe(1_050_000);
+      } finally {
+        await agent.shutdown();
+      }
+    });
+
+    for (const preserveWindow of [false, true]) test(`T3 send of High only from off-grid 1.05M ends on a real preset (runtime keeps window: ${preserveWindow})`, async () => {
+      const server = lunaServer("low", 1_050_000);
+      server.preserveWindow = preserveWindow;
+      const agent = createAgent(server);
+      const { context } = createContext();
+      try {
+        const { sessionId, configOptions } = await openSession(agent, context);
+        const { live, rejected } = await t3Send(agent, sessionId, configOptions, [{ id: "reasoning_effort", value: "high" }]);
+        expect(rejected).toEqual([]);
+        // First catalog High preset is the 350K one; its window is applied, not the off-grid one kept.
+        expect(server.updatedModelPayloads).toEqual([{ model_id: "luna-high", model_handle: LUNA }]);
+        expect(server.contextUpdates.map((update) => update.body))
+          .toEqual(preserveWindow ? [{ context_window_limit: 350_000 }] : []);
+        expect(server.contextWindow).toBe(350_000);
+        expect(server.modelSettings).toEqual({ provider_type: "chatgpt_oauth", reasoning: { reasoning_effort: "high" } });
+        expect(find(live, "reasoning_effort")).toMatchObject({ currentValue: "high" });
+        expect(find(live, "context_window")).toMatchObject({
+          currentValue: "350000",
+          options: [{ value: "350000", name: "350K tokens" }, { value: "950000", name: "950K tokens" }],
+        });
+        await expect(agent.setSessionConfigOption({ sessionId, configId: "context_window", value: "1050000" }))
+          .rejects.toThrow("Unsupported context size");
+      } finally {
+        await agent.shutdown();
+      }
+    });
+
+    test("T3 send of 950K + High in one snapshot reaches exactly that preset; reactivation is stable", async () => {
+      const server = lunaServer("low", 1_050_000);
+      const agent = createAgent(server);
+      const { context } = createContext();
+      const selections = [{ id: "reasoning_effort", value: "high" }, { id: "context_window", value: "950000" }];
+      try {
+        const { sessionId, configOptions } = await openSession(agent, context);
+        const { live, rejected } = await t3Send(agent, sessionId, configOptions, selections);
+        expect(rejected).toEqual([]);
+        // Context is listed first, so it is applied first and no 350K preset is written on the way.
+        expect(server.contextUpdates.map((update) => update.body)).toEqual([{ context_window_limit: 950_000 }]);
+        expect(server.updatedModelPayloads).toEqual([{ model_id: "luna-1m-high", model_handle: LUNA }]);
+        expect(find(live, "context_window")).toMatchObject({ currentValue: "950000" });
+        expect(find(live, "reasoning_effort")).toMatchObject({ currentValue: "high" });
+
+        const reloaded = await agent.loadSession({ sessionId, cwd: "/tmp/letta-acp-test", mcpServers: [] }, context);
+        await t3Send(agent, sessionId, reloaded.configOptions, selections);
+        expect(server.contextUpdates).toHaveLength(1);
+        expect(server.updatedModelPayloads).toHaveLength(1);
+      } finally {
+        await agent.shutdown();
+      }
+    });
+
+    test("effort keeps the chosen window and context keeps the chosen effort, across reload", async () => {
+      const server = lunaServer("low", 350_000);
+      const agent = createAgent(server);
+      const { context } = createContext();
+      try {
+        const { sessionId, configOptions } = await openSession(agent, context);
+        expect(values(configOptions, "reasoning_effort")).toEqual(ALL_EFFORTS);
+        expect(values(configOptions, "context_window")).toEqual(["350000", "950000"]);
+        expect(find(configOptions, "reasoning_effort")?.description).toContain("keeps the context size");
+
+        await agent.setSessionConfigOption({ sessionId, configId: "context_window", value: "950000" });
+        const effort = await agent.setSessionConfigOption({ sessionId, configId: "reasoning_effort", value: "high" });
+        expect(server.updatedModelPayloads).toEqual([{ model_id: "luna-1m-high", model_handle: LUNA }]);
+        expect(find(effort.configOptions, "context_window")).toMatchObject({ currentValue: "950000" });
+        expect(find(effort.configOptions, "reasoning_effort")).toMatchObject({ currentValue: "high" });
+
+        const context350 = await agent.setSessionConfigOption({ sessionId, configId: "context_window", value: "350000" });
+        expect(find(context350.configOptions, "reasoning_effort")).toMatchObject({ currentValue: "high" });
+        expect(server.modelSettings).toEqual({ provider_type: "chatgpt_oauth", reasoning: { reasoning_effort: "high" } });
+        expect(server.modelHandle).toBe(LUNA);
+
+        const loaded = await agent.loadSession({ sessionId, cwd: "/tmp/letta-acp-test", mcpServers: [] }, context);
+        expect(find(loaded.configOptions, "reasoning_effort")).toMatchObject({ currentValue: "high" });
+        expect(find(loaded.configOptions, "context_window")).toMatchObject({ currentValue: "350000" });
+        expect(server.contextUpdates.map((update) => update.body)).toEqual([
+          { context_window_limit: 950_000 }, { context_window_limit: 350_000 },
+        ]);
+        expect(server.updatedModelPayloads).toHaveLength(1);
+      } finally {
+        await agent.shutdown();
+      }
+    });
+
+    test("an unreported effort is shown as such beside every tier; a window choice adopts that window's first real preset", async () => {
+      const server = lunaServer("low", 350_000);
+      server.modelSettings = { provider_type: "chatgpt_oauth", reasoning: null };
+      const agent = createAgent(server);
+      const { context } = createContext();
+      try {
+        const { sessionId, configOptions } = await openSession(agent, context);
+        expect(find(configOptions, "reasoning_effort")).toMatchObject({
+          currentValue: "unknown",
+          options: [{ value: "unknown", name: "Not reported" }, ...ALL_EFFORTS.map((value) => ({ value, name: value }))],
+        });
+        await agent.setSessionConfigOption({ sessionId, configId: "reasoning_effort", value: "unknown" });
+        expect(server.updatedModelPayloads).toEqual([]);
+        const result = await agent.setSessionConfigOption({ sessionId, configId: "context_window", value: "950000" });
+        expect(server.updatedModelPayloads).toEqual([{ model_id: "luna-1m-none", model_handle: LUNA }]);
+        expect(server.contextUpdates).toEqual([]);
+        expect(find(result.configOptions, "reasoning_effort")).toMatchObject({ currentValue: "none" });
+        expect(find(result.configOptions, "context_window")).toMatchObject({ currentValue: "950000" });
+      } finally {
+        await agent.shutdown();
+      }
+    });
+
+    test("a sparse grid offers one selector of real presets and never an impossible pair", async () => {
+      const server = new FakeAppServer();
+      server.opusCatalog = true;
+      server.modelHandle = "anthropic/claude-opus-5";
+      server.modelSettings = { provider_type: "anthropic", effort: "low" };
+      server.contextWindow = 1_000_000;
+      const agent = createAgent(server);
+      const { context } = createContext();
+      try {
+        const { sessionId, configOptions } = await openSession(agent, context);
+        expect(find(configOptions, "reasoning_effort")).toBeUndefined();
+        expect(find(configOptions, "context_window")).toBeUndefined();
+        expect(find(configOptions, "letta_preset")).toMatchObject({
+          name: "Reasoning & context",
+          category: "thought_level",
+          currentValue: "current",
+          options: [
+            { value: "current", name: "low · 1M tokens (current, not a Letta preset)" },
+            { value: "opus-5-low", name: "low · 200K tokens" },
+            { value: "opus-5-medium", name: "medium · 200K tokens" },
+            { value: "opus-5-high", name: "high · 200K tokens" },
+            { value: "opus-5-xhigh", name: "xhigh · 200K tokens" },
+            { value: "opus-5-max", name: "max · 200K tokens" },
+            { value: "opus-5-1m", name: "high · 950K tokens" },
+          ],
+        });
+        await agent.setSessionConfigOption({ sessionId, configId: "letta_preset", value: "current" });
+        for (const [configId, value] of [["letta_preset", "opus-5-low-1m"], ["reasoning_effort", "high"], ["context_window", "950000"]]) {
+          await expect(agent.setSessionConfigOption({ sessionId, configId: configId!, value: value! })).rejects.toThrow("Unsupported");
+        }
+        expect(server.updatedModelPayloads).toEqual([]);
+        const { live } = await t3Send(agent, sessionId, configOptions, [{ id: "letta_preset", value: "opus-5-1m" }]);
+        expect(server.updatedModelPayloads).toEqual([{ model_id: "opus-5-1m", model_handle: "anthropic/claude-opus-5" }]);
+        expect(find(live, "letta_preset")).toMatchObject({ currentValue: "opus-5-1m" });
+        expect(values(live, "letta_preset")).not.toContain("current");
+        await t3Send(agent, sessionId, live, [{ id: "letta_preset", value: "opus-5-1m" }]);
+        expect(server.updatedModelPayloads).toHaveLength(1);
+      } finally {
+        await agent.shutdown();
+      }
+    });
+
+    test("a failed window correction after a preset update reports the actual state and releases the queue", async () => {
+      const server = lunaServer("low", 1_050_000);
+      server.preserveWindow = true;
+      server.rejectContextUpdate = true;
+      const agent = createAgent(server);
+      const { context, updates } = createContext();
+      try {
+        const { sessionId } = await openSession(agent, context);
+        await expect(agent.setSessionConfigOption({ sessionId, configId: "reasoning_effort", value: "high" }))
+          .rejects.toThrow("Letta context window update failed");
+        const refresh = updates.filter((update) => update.sessionUpdate === "config_option_update").at(-1);
+        expect(find(refresh?.configOptions as Options, "reasoning_effort")).toMatchObject({ currentValue: "high" });
+        expect(find(refresh?.configOptions as Options, "context_window")).toMatchObject({ currentValue: "1050000" });
+        expect(JSON.stringify(updates)).not.toContain("secret");
+        server.rejectContextUpdate = false;
+        const next = await agent.setSessionConfigOption({ sessionId, configId: "context_window", value: "350000" });
+        expect(find(next.configOptions, "context_window")).toMatchObject({ currentValue: "350000" });
+        expect(find(next.configOptions, "reasoning_effort")).toMatchObject({ currentValue: "high" });
+      } finally {
+        await agent.shutdown();
+      }
+    });
+
+    test("default conversation writes the agent scope", async () => {
+      const server = lunaServer("medium", 350_000);
+      server.defaultConversation = true;
+      server.agentModel = LUNA;
+      server.agentSettings = server.modelSettings;
+      server.agentContextWindow = 350_000;
+      server.contextWindow = undefined;
+      const agent = createAgent(server);
+      const { context } = createContext();
+      try {
+        const { sessionId, configOptions } = await openSession(agent, context);
+        expect(sessionId).toBe("default");
+        expect(find(configOptions, "context_window")).toMatchObject({ currentValue: "350000" });
+        const result = await agent.setSessionConfigOption({ sessionId, configId: "context_window", value: "950000" });
+        expect(server.contextUpdates).toEqual([{ scope: "agent", body: { context_window_limit: 950_000 } }]);
+        expect(find(result.configOptions, "context_window")).toMatchObject({ currentValue: "950000" });
+        expect(find(result.configOptions, "reasoning_effort")).toMatchObject({ currentValue: "medium" });
+        expect(server.conversationRetrieveIds).toEqual([]);
+      } finally {
+        await agent.shutdown();
+      }
+    });
+
+    for (const failure of ["rejected", "unconfirmed"] as const) test(`${failure} context write reports persisted state and releases the queue`, async () => {
+      const server = lunaServer("low", 350_000);
+      if (failure === "rejected") server.rejectContextUpdate = true;
+      else server.ignoreContextUpdate = true;
+      const agent = createAgent(server);
+      const { context, updates } = createContext();
+      try {
+        const { sessionId } = await openSession(agent, context);
+        await expect(agent.setSessionConfigOption({ sessionId, configId: "context_window", value: "950000" }))
+          .rejects.toThrow(failure === "rejected" ? "Letta context window update failed" : "did not confirm");
+        const refresh = updates.filter((update) => update.sessionUpdate === "config_option_update").at(-1);
+        expect(find(refresh?.configOptions as Options, "context_window")).toMatchObject({ currentValue: "350000" });
+        expect(JSON.stringify(updates)).not.toContain("secret");
+        server.rejectContextUpdate = server.ignoreContextUpdate = false;
+        const next = await agent.setSessionConfigOption({ sessionId, configId: "context_window", value: "950000" });
+        expect(find(next.configOptions, "context_window")).toMatchObject({ currentValue: "950000" });
+      } finally {
+        await agent.shutdown();
+      }
+    });
+
+    test("a prompt waits for an admitted context change and rejects new ones while active", async () => {
+      const server = lunaServer("low", 350_000);
+      const agent = createAgent(server);
+      const { context } = createContext();
+      let release: (() => void) | undefined;
+      try {
+        const { sessionId } = await openSession(agent, context);
+        const paused = server.pauseNextModelUpdate();
+        const change = agent.setSessionConfigOption({ sessionId, configId: "context_window", value: "950000" });
+        await paused.received;
+        release = paused.release;
+        const prompt = agent.prompt({ sessionId, prompt: [{ type: "text", text: "hello" }] }, context);
+        await expect(agent.setSessionConfigOption({ sessionId, configId: "context_window", value: "350000" }))
+          .rejects.toThrow("Cannot change configuration during a prompt");
+        expect(server.inputModels).toEqual([]);
+        release();
+        await change;
+        await prompt;
+        expect(server.inputModels).toEqual([LUNA]);
+        expect(server.contextWindow).toBe(950_000);
+      } finally {
+        release?.();
+        await agent.shutdown();
+      }
+    });
+
+    test("refreshes after prompts and slash commands, notifying only on change", async () => {
+      const server = lunaServer("low", 350_000);
+      const agent = createAgent(server);
+      // The fake command requests one approval; answer it like the command recovery test.
+      const { context, updates } = createContext({ permissionDelayMs: 10 });
+      const snapshots = () => updates.filter((update) => update.sessionUpdate === "config_option_update");
+      // A no-op queued mutation resolves after the post-prompt refresh.
+      const settle = (sessionId: string) =>
+        agent.setSessionConfigOption({ sessionId, configId: "reasoning_effort", value: "low" });
+      try {
+        const { sessionId } = await openSession(agent, context);
+        await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hello" }] }, context);
+        await settle(sessionId);
+        expect(snapshots()).toHaveLength(0);
+
+        // e.g. /context-limit or another client changed persisted state.
+        // The fake reuses a run id per prompt kind, so each turn uses a distinct kind.
+        server.contextWindow = 950_000;
+        await agent.prompt({ sessionId, prompt: [{ type: "text", text: "edit prompt" }] }, context);
+        const settled = await settle(sessionId);
+        expect(find(snapshots().at(-1)?.configOptions as Options, "context_window")).toMatchObject({ currentValue: "950000" });
+        expect(find(settled.configOptions, "context_window")).toMatchObject({ currentValue: "950000" });
+        expect(snapshots()).toHaveLength(1);
+
+        server.contextWindow = 1_050_000;
+        await agent.prompt({ sessionId, prompt: [{ type: "text", text: "/compact" }] }, context);
+        await settle(sessionId);
+        expect(find(snapshots().at(-1)?.configOptions as Options, "context_window")).toMatchObject({ currentValue: "1050000" });
+
+        // A failed read keeps the last confirmed state rather than hiding it.
+        server.rejectModelState = true;
+        await agent.prompt({ sessionId, prompt: [{ type: "text", text: "fragmented prompt" }] }, context);
+        const kept = await settle(sessionId);
+        expect(find(kept.configOptions, "reasoning_effort")).toMatchObject({ currentValue: "low" });
+        expect(find(kept.configOptions, "context_window")).toMatchObject({ currentValue: "1050000" });
+        expect(server.updatedModelPayloads).toEqual([]);
+        expect(server.contextUpdates).toEqual([]);
+      } finally {
+        await agent.shutdown();
+      }
+    });
+
+    test("a change requested right after a prompt is applied after, and not undone by, its refresh", async () => {
+      const server = lunaServer("low", 350_000);
+      const agent = createAgent(server);
+      const { context, updates } = createContext();
+      try {
+        const { sessionId } = await openSession(agent, context);
+        await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hello" }] }, context);
+        const result = await agent.setSessionConfigOption({ sessionId, configId: "context_window", value: "950000" });
+        expect(find(result.configOptions, "context_window")).toMatchObject({ currentValue: "950000" });
+        await agent.setSessionConfigOption({ sessionId, configId: "reasoning_effort", value: "low" });
+        const stale = updates.filter((update) => update.sessionUpdate === "config_option_update")
+          .some((update) => find(update.configOptions as Options, "context_window")?.currentValue === "350000");
+        expect(stale).toBe(false);
+        expect(server.contextWindow).toBe(950_000);
+      } finally {
+        await agent.shutdown();
+      }
+    });
+
+    test("a refresh for a displaced session does not notify its old client", async () => {
+      const server = lunaServer("low", 350_000);
+      const agent = createAgent(server);
+      const first = createContext();
+      const second = createContext();
+      let release: (() => void) | undefined;
+      try {
+        const { sessionId } = await openSession(agent, first.context);
+        const sessions = (agent as unknown as { sessions: Map<string, { configTail: Promise<void> }> }).sessions;
+        const displaced = sessions.get(sessionId)!;
+        server.contextWindow = 950_000;
+        const paused = server.pauseNextAgentRetrieve();
+        await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hello" }] }, first.context);
+        await paused.received;
+        release = paused.release;
+        const loaded = await agent.loadSession({ sessionId, cwd: "/tmp/letta-acp-test", mcpServers: [] }, second.context);
+        expect(find(loaded.configOptions, "context_window")).toMatchObject({ currentValue: "950000" });
+        release();
+        await displaced.configTail;
+        expect(first.updates.filter((update) => update.sessionUpdate === "config_option_update")).toEqual([]);
+      } finally {
+        release?.();
+        await agent.shutdown();
+      }
+    });
+
+    test("same-effort presets differing beyond context_window use the real-preset selector", async () => {
+      const server = lunaServer("low", 350_000);
+      server.lunaDivergent = true;
+      const agent = createAgent(server);
+      const { context } = createContext();
+      try {
+        const { sessionId, configOptions } = await openSession(agent, context);
+        expect(find(configOptions, "context_window")).toBeUndefined();
+        expect(find(configOptions, "reasoning_effort")).toBeUndefined();
+        expect(find(configOptions, "letta_preset")).toMatchObject({ currentValue: "luna-low" });
+        expect(values(configOptions, "letta_preset")).toHaveLength(12);
+        await expect(agent.setSessionConfigOption({ sessionId, configId: "context_window", value: "950000" }))
+          .rejects.toThrow("Unsupported context size");
+        await agent.setSessionConfigOption({ sessionId, configId: "letta_preset", value: "luna-1m-low" });
+        expect(server.updatedModelPayloads).toEqual([{ model_id: "luna-1m-low", model_handle: LUNA }]);
+        expect(server.contextUpdates).toEqual([]);
+      } finally {
+        await agent.shutdown();
+      }
+    });
+
+    test("a route without effort presets shows no effort selector, even with a persisted effort", async () => {
+      const server = new FakeAppServer();
+      server.modelHandle = "test/other-model";
+      server.modelSettings = { provider_type: "openai", reasoning: { reasoning_effort: "high" } };
+      server.contextWindow = 100_000;
+      const agent = createAgent(server);
+      const { context } = createContext();
+      try {
+        const { configOptions } = await openSession(agent, context);
+        expect(find(configOptions, "reasoning_effort")).toBeUndefined();
+        expect(find(configOptions, "context_window")).toBeUndefined();
+      } finally {
+        await agent.shutdown();
+      }
+    });
+
+    test("windowless presets are not applied at the legacy 128000 clamp the runtime would resize", async () => {
+      const server = new FakeAppServer();
+      server.reasoningModel = true;
+      server.modelSettings = { effort: "high" };
+      server.contextWindow = 128_000;
+      const agent = createAgent(server);
+      const { context } = createContext();
+      try {
+        const { sessionId, configOptions } = await openSession(agent, context);
+        expect(find(configOptions, "reasoning_effort")).toMatchObject({
+          currentValue: "high",
+          description: expect.stringContaining("use /model"),
+          options: [{ value: "high", name: "high (current, not a Letta preset here)" }],
+        });
+        await expect(agent.setSessionConfigOption({ sessionId, configId: "reasoning_effort", value: "low" }))
+          .rejects.toThrow("Unsupported reasoning effort");
+        expect(server.updatedModelPayloads).toEqual([]);
+        server.contextWindow = 100_000;
+        const loaded = await agent.loadSession({ sessionId, cwd: "/tmp/letta-acp-test", mcpServers: [] }, context);
+        expect(values(loaded.configOptions, "reasoning_effort")).toEqual(["low", "high"]);
+      } finally {
+        await agent.shutdown();
+      }
+    });
+
+    test("model switch keeps the model menu's current route first", async () => {
+      const server = lunaServer("low", 350_000);
+      const agent = createAgent(server);
+      const { context } = createContext();
+      try {
+        const { sessionId } = await openSession(agent, context);
+        const switched = await agent.setSessionConfigOption({ sessionId, configId: "model", value: "test/other-model" });
+        expect(server.updatedModelPayloads).toEqual([{ model_id: "other-model", model_handle: "test/other-model" }]);
+        expect(find(switched.configOptions, "model")?.options[0]?.value).toBe("test/other-model");
+        expect(find(switched.configOptions, "model")?.options.map((option) => option.value).sort())
+          .toEqual([LUNA, "test/model", "test/other-model"].sort());
+        const back = await agent.setSessionConfigOption({ sessionId, configId: "model", value: LUNA });
+        expect(server.updatedModelPayloads.at(-1)).toEqual({ model_id: "luna-medium", model_handle: LUNA });
+        expect(find(back.configOptions, "context_window")).toMatchObject({ currentValue: "350000" });
+        expect(find(back.configOptions, "reasoning_effort")).toMatchObject({ currentValue: "medium" });
+      } finally {
+        await agent.shutdown();
+      }
+    });
   });
 
   test("switches permission enforcement through session config options", async () => {

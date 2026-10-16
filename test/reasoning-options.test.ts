@@ -78,20 +78,69 @@ describe("reasoning settings", () => {
       options: [{ value: "low", name: "low" }, { value: "high", name: "high" }],
     });
     expect(reasoningOption(scoped, undefined)).toBeUndefined();
-    expect(reasoningOption(scoped, "xhigh")).toBeUndefined();
+    // A known effort without an applicable preset is displayed, not offered.
+    expect(reasoningOption(scoped, "medium")).toMatchObject({
+      currentValue: "medium",
+      description: expect.stringContaining("choose a listed tier"),
+      options: [
+        { value: "low", name: "low" },
+        { value: "medium", name: "medium (current, not a Letta preset here)" },
+        { value: "high", name: "high" },
+      ],
+    });
+    expect(reasoningOption([], "low")).toMatchObject({
+      currentValue: "low",
+      description: expect.stringContaining("use /model"),
+      options: [{ value: "low", name: "low (current, not a Letta preset here)" }],
+    });
   });
 
-  test("uses runtime preset inference for custom context and unions BYOK capabilities", () => {
-    expect(reasoningEntries(entries.slice(0, 2), "openai/test", undefined, 200)).toEqual(entries.slice(0, 2));
+  test("windowless presets are not offered at the legacy 128000 clamp unless a 128000 family exists", () => {
+    const windowless = entries.slice(3);
+    expect(reasoningEntries(windowless, "anthropic/test", undefined, 128000)).toEqual([]);
+    expect(reasoningEntries(windowless, "anthropic/test", undefined, 127999)).toEqual(windowless);
+    const clamp = { ...entries[3]!, id: "clamp", updateArgs: { reasoning_effort: "high", context_window: 128000 } };
+    expect(reasoningEntries([...windowless, clamp], "anthropic/test", undefined, 128000)).toEqual([clamp]);
+  });
+
+  test("offers effort presets only at the actual window and unions BYOK capabilities", () => {
     const byok = { ...entries[0]!, id: "byok-low", handle: "lc-openai/test" };
     expect(reasoningEntries([...entries, byok], byok.handle, { "lc-openai": "openai" }, 100))
       .toEqual([entries[0]!, entries[1]!, byok]);
     expect(reasoningEntries(entries, "openai/test", undefined, 200))
       .toEqual([entries[2]!]);
-    expect(reasoningEntries(entries, "openai/test", undefined, 42000)).toEqual([]);
-    expect(reasoningEntries(entries, "openai/test", undefined, 128000)).toEqual([]);
-    expect(reasoningEntries(entries.slice(0, 2), "openai/test", undefined, 128000))
-      .toEqual(entries.slice(0, 2));
+    // Off-preset and unknown windows: any effort preset would also resize.
+    for (const window of [42000, 128000, undefined]) {
+      expect(reasoningEntries(entries, "openai/test", undefined, window)).toEqual([]);
+      expect(reasoningEntries(entries.slice(0, 2), "openai/test", undefined, window)).toEqual([]);
+    }
+    // Presets without a window never resize, whatever the actual window is.
+    expect(reasoningEntries(entries, "anthropic/test", undefined, 42000)).toEqual([entries[3]!]);
+  });
+
+  test("settings-only conversation overrides apply to the agent route", () => {
+    const agent = {
+      model: "chatgpt-plus-pro/gpt-6-luna",
+      model_settings: { provider_type: "chatgpt_oauth", reasoning: { reasoning_effort: "high" } },
+      llm_config: { reasoning_effort: "high", context_window: 350000 },
+      context_window_limit: 350000,
+    };
+    const settingsOnly = scopedModelSnapshot(agent, {
+      model: null,
+      model_settings: { provider_type: "chatgpt_oauth", reasoning: { reasoning_effort: "low" } },
+      context_window_limit: 1050000,
+    });
+    expect(settingsOnly.model).toBe(agent.model);
+    expect(effectiveEffort(settingsOnly.settings, settingsOnly.legacy)).toBe("low");
+    expect(settingsOnly.contextWindow).toBe(1050000);
+    const contextOnly = scopedModelSnapshot(agent, { model: null, model_settings: null, context_window_limit: 950000 });
+    expect(effectiveEffort(contextOnly.settings, contextOnly.legacy)).toBe("high");
+    expect(contextOnly.contextWindow).toBe(950000);
+    const empty = scopedModelSnapshot(agent, { model: null, model_settings: null, context_window_limit: null });
+    expect(empty).toEqual(scopedModelSnapshot(agent));
+    expect(empty.contextWindow).toBe(350000);
+    const reset = scopedModelSnapshot(agent, { model: null, model_settings: { reasoning: null } });
+    expect(effectiveEffort(reset.settings, reset.legacy)).toBeUndefined();
   });
 
   test("scoped null clears inherited legacy and provider effort representations", () => {

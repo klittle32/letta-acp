@@ -28,6 +28,7 @@ import {
   type CanUseToolContext,
   type CanUseToolResponse,
   LettaAgentClient,
+  type LettaCodeModelEntry,
   type LettaCodeSession,
   type LettaConversation,
   type McpServers,
@@ -44,11 +45,24 @@ import {
   type ReasoningEffort,
   presetEffort,
   isReasoningEffort,
+  presetWindow,
   reasoningEntries,
   reasoningOption,
   scopedModelSnapshot,
 } from "./reasoning-options.js";
-import { modelHandle, modelOptions, modelSelection } from "./model-options.js";
+import { currentHandleLabel, modelHandle, modelOptions, modelSelection } from "./model-options.js";
+import {
+  CONTEXT_WINDOW_ID,
+  CURRENT_VALUE,
+  PRESET_ID,
+  UNKNOWN_VALUE,
+  contextOption,
+  effortOption,
+  effortTarget,
+  presetGrid,
+  presetOption,
+  presetFor,
+} from "./preset-grid.js";
 import {
   REQUESTED_EFFORT_ID,
   proxyOverrideAvailable,
@@ -126,6 +140,8 @@ interface AcpSessionState {
   reasoningEffort: ReasoningEffort | undefined;
   requestedEffort?: RequestedEffort;
   contextWindow: number | undefined;
+  /** Last configOptions snapshot sent to the client, to suppress no-op refreshes. */
+  advertisedConfig?: string;
 }
 
 /** Max history messages replayed on session/load. */
@@ -387,9 +403,10 @@ export class LettaAcpAgent {
     // A custom model handle may be active even when it is not in the curated
     // catalog. ACP requires currentValue to identify one of the options, so
     // retain that model rather than falsely presenting a different selection.
-    if (currentValue && !options.some((option) => option.value === currentValue)) {
-      options.unshift({ value: currentValue, name: currentValue });
-    }
+    // List the current route first so clients that cap long menus keep it.
+    const currentIndex = options.findIndex((option) => option.value === currentValue);
+    const [current] = currentIndex >= 0 ? options.splice(currentIndex, 1) : [];
+    if (currentValue) options.unshift(current ?? { value: currentValue, name: currentHandleLabel(currentValue) });
     const configOptions: SessionConfigOption[] = [
       permissionModeConfigOption(state.modeId),
     ];
@@ -404,15 +421,51 @@ export class LettaAcpAgent {
         options,
       });
     }
-    const thoughtLevel = reasoningOption(
-      reasoningEntries(entries, state.currentModel, byokProviderAliases, state.contextWindow),
-      state.reasoningEffort,
-    );
+    const grid = presetGrid(entries, state.currentModel, byokProviderAliases);
     if (proxyOverrideBackendAvailable(this.config.clientOptions) &&
         proxyOverrideAvailable(entries, state.currentModel, state.contextWindow)) {
       configOptions.push(requestedEffortOption(state.requestedEffort));
-    } else if (thoughtLevel) configOptions.push(thoughtLevel);
+    } else if (grid.kind === "rectangular") {
+      // Context first: clients replaying stored selections in option order
+      // then reach the chosen pair without an intermediate preset.
+      const context = contextOption(grid, state.contextWindow);
+      if (context) configOptions.push(context);
+      configOptions.push(effortOption(grid, state.reasoningEffort, state.contextWindow));
+    } else if (grid.kind === "sparse") {
+      configOptions.push(presetOption(grid, state.reasoningEffort, state.contextWindow));
+    } else if (grid.kind === "windowless") {
+      const thoughtLevel = reasoningOption(
+        reasoningEntries(entries, state.currentModel, byokProviderAliases, state.contextWindow),
+        state.reasoningEffort,
+      );
+      if (thoughtLevel) configOptions.push(thoughtLevel);
+    }
+    state.advertisedConfig = JSON.stringify(configOptions);
     return configOptions;
+  }
+
+  /**
+   * Re-read persisted model state after a prompt (turns and slash commands can
+   * change it) and tell the client only when its snapshot changed. Runs on the
+   * mutation queue, so it reads after every previously admitted change and any
+   * later change applies after it. A failed read keeps the last confirmed state.
+   */
+  private scheduleModelRefresh(sessionId: string, state: AcpSessionState): void {
+    const refresh = state.configTail.then(async () => {
+      if (this.sessions.get(sessionId) !== state) return;
+      const before = state.advertisedConfig;
+      if (!await this.hydrateModelSettings(state, { keepOnFailure: true })) return;
+      const configOptions = await this.sessionConfigOptions(state);
+      // A load can displace this session while state was being read.
+      if (state.advertisedConfig === before || this.sessions.get(sessionId) !== state) return;
+      await state.clientContext.notify(methods.client.session.update, {
+        sessionId,
+        update: { sessionUpdate: "config_option_update", configOptions },
+      });
+    });
+    state.configTail = refresh.catch(() => {
+      log("model state refresh after prompt unavailable");
+    });
   }
 
   private async modelCatalog(state: AcpSessionState) {
@@ -434,10 +487,16 @@ export class LettaAcpAgent {
     return result;
   }
 
-  private async hydrateModelSettings(state: AcpSessionState): Promise<void> {
-    state.reasoningEffort = undefined;
-    state.requestedEffort = undefined;
-    state.contextWindow = undefined;
+  /** Returns whether persisted state was read. */
+  private async hydrateModelSettings(
+    state: AcpSessionState,
+    options: { keepOnFailure?: boolean } = {},
+  ): Promise<boolean> {
+    if (!options.keepOnFailure) {
+      state.reasoningEffort = undefined;
+      state.requestedEffort = undefined;
+      state.contextWindow = undefined;
+    }
     try {
       const [agent, conversation] = await Promise.all([
         this.client.agents.retrieve(state.session.agentId!),
@@ -450,9 +509,80 @@ export class LettaAcpAgent {
       state.reasoningEffort = effectiveEffort(snapshot.settings, snapshot.legacy);
       state.requestedEffort = requestedEffort(snapshot.settings);
       state.contextWindow = snapshot.contextWindow;
+      return true;
     } catch {
       // Missing state must not become an invented "medium"/"default" selection.
       log("persisted model settings unavailable; reasoning/context remain unconfirmed");
+      return false;
+    }
+  }
+
+  /**
+   * Apply a Letta preset context window without touching route or settings,
+   * through the same public scoped update Letta's /context-limit uses.
+   */
+  private async updateSessionContext(
+    sessionId: string,
+    state: AcpSessionState,
+    contextWindow: number,
+  ): Promise<void> {
+    let failure: string | undefined;
+    try {
+      if (state.session.conversationId === "default") {
+        await this.client.agents.update(state.session.agentId!, { contextWindowLimit: contextWindow });
+      } else {
+        await this.client.conversations.update(state.session.conversationId!, { contextWindowLimit: contextWindow });
+      }
+    } catch {
+      // Backend error strings can include URLs, headers, or credentials.
+      failure = "Letta context window update failed; runtime rejected the update or is unavailable";
+    }
+    // Report persisted state, never the requested value. A failed or timed-out
+    // write may still have landed, so refresh the client in either case.
+    const read = await this.hydrateModelSettings(state);
+    if (!failure && (!read || state.contextWindow !== contextWindow)) {
+      failure = "Letta did not confirm the context window update";
+    }
+    if (!failure) {
+      log(`context window -> ${contextWindow}`);
+      return;
+    }
+    await this.notifyActualConfiguration(sessionId, state);
+    log(failure);
+    throw RequestError.internalError(undefined, failure);
+  }
+
+  /**
+   * Before a failed mutation returns its error, best-effort tell the client the
+   * persisted state just re-read: the write may have landed anyway.
+   */
+  private async notifyActualConfiguration(sessionId: string, state: AcpSessionState): Promise<void> {
+    try {
+      await state.clientContext.notify(methods.client.session.update, {
+        sessionId,
+        update: { sessionUpdate: "config_option_update", configOptions: await this.sessionConfigOptions(state) },
+      });
+    } catch {
+      log("configuration refresh notification unavailable");
+    }
+  }
+
+  /**
+   * Apply one real catalog preset by exact id and route, then confirm the
+   * result. The runtime can keep a previous window that is not this preset's
+   * (its preservation heuristic); move it onto the preset window so the session
+   * ends on the genuine tuple. A failed correction reports the actual state.
+   */
+  private async applyPreset(
+    sessionId: string,
+    state: AcpSessionState,
+    entry: LettaCodeModelEntry,
+  ): Promise<void> {
+    await this.updateSessionModel(state, { modelId: entry.id, modelHandle: state.currentModel });
+    const window = presetWindow(entry);
+    if (window !== undefined && state.contextWindow !== window) {
+      log(`preset ${entry.id}: runtime reported window ${state.contextWindow ?? "unknown"}; applying preset window ${window}`);
+      await this.updateSessionContext(sessionId, state, window);
     }
   }
 
@@ -548,17 +678,7 @@ export class LettaAcpAgent {
           // A malformed acknowledgement can follow a persisted update. Re-read
           // authoritative state; never claim that the requested value succeeded.
           await this.hydrateModelSettings(state);
-          try {
-            await state.clientContext.notify(methods.client.session.update, {
-              sessionId: params.sessionId,
-              update: {
-                sessionUpdate: "config_option_update",
-                configOptions: await this.sessionConfigOptions(state),
-              },
-            });
-          } catch {
-            log("proxy configuration refresh notification unavailable");
-          }
+          await this.notifyActualConfiguration(params.sessionId, state);
           log("proxy reasoning update failed: runtime rejected the update or returned an invalid response");
           throw RequestError.internalError(undefined, "Letta requested effort update failed");
         }
@@ -567,19 +687,57 @@ export class LettaAcpAgent {
         state.reasoningEffort = effectiveEffort(settings);
         return { configOptions: await this.sessionConfigOptions(state) };
       }
+      const { entries, byokProviderAliases } = await this.modelCatalog(state);
+      state.currentModel = modelHandle(entries, state.currentModel);
+      const grid = presetGrid(entries, state.currentModel, byokProviderAliases);
+      const unchanged = async () => ({ configOptions: await this.sessionConfigOptions(state) });
       if (params.configId === "reasoning_effort") {
-        const { entries, byokProviderAliases } = await this.modelCatalog(state);
-        state.currentModel = modelHandle(entries, state.currentModel);
-        const supported = reasoningEntries(entries, state.currentModel, byokProviderAliases, state.contextWindow);
-        if (!isReasoningEffort(params.value) ||
-            !supported.some((entry) => presetEffort(entry) === params.value)) {
+        // Clients resubmit unchanged values, including displayed state that is
+        // not a choice (a non-preset or unreported current effort).
+        if (params.value === (state.reasoningEffort ?? (grid.kind === "rectangular" ? UNKNOWN_VALUE : undefined))) {
+          return unchanged();
+        }
+        if (grid.kind === "rectangular" && isReasoningEffort(params.value) && grid.efforts.includes(params.value)) {
+          await this.applyPreset(params.sessionId, state, effortTarget(grid, params.value, state.contextWindow));
+          return unchanged();
+        }
+        const supported = grid.kind === "windowless"
+          ? reasoningEntries(entries, state.currentModel, byokProviderAliases, state.contextWindow) : [];
+        const entry = supported.find((candidate) => presetEffort(candidate) === params.value);
+        if (!entry) {
           throw RequestError.invalidParams(undefined, "Unsupported reasoning effort for the current model");
         }
-        await this.updateSessionModel(state, {
-          modelId: supported.find((entry) => presetEffort(entry) === params.value)!.id,
-          modelHandle: state.currentModel,
-        });
-        return { configOptions: await this.sessionConfigOptions(state) };
+        // Windowless presets keep the current window (see reasoningEntries).
+        await this.updateSessionModel(state, { modelId: entry.id, modelHandle: state.currentModel });
+        return unchanged();
+      }
+      if (params.configId === CONTEXT_WINDOW_ID) {
+        const requested = typeof params.value === "string" && /^[1-9][0-9]*$/.test(params.value)
+          ? Number(params.value) : undefined;
+        if (requested !== undefined && requested === state.contextWindow) return unchanged();
+        if (grid.kind !== "rectangular" || requested === undefined || !grid.windows.includes(requested)) {
+          throw RequestError.invalidParams(undefined, "Unsupported context size for the current model");
+        }
+        // In a rectangular grid the current tier exists at every window with
+        // otherwise identical settings, so a context-only write is that preset.
+        // An unreported or non-preset tier adopts the window's first real preset.
+        if (state.reasoningEffort !== undefined && grid.efforts.includes(state.reasoningEffort)) {
+          await this.updateSessionContext(params.sessionId, state, requested);
+        } else {
+          await this.applyPreset(params.sessionId, state,
+            grid.presets.find((candidate) => presetWindow(candidate) === requested)!);
+        }
+        return unchanged();
+      }
+      if (params.configId === PRESET_ID) {
+        const current = grid.kind === "sparse"
+          ? presetFor(grid.tuples, state.reasoningEffort, state.contextWindow) : undefined;
+        if (grid.kind === "sparse" && params.value === (current?.id ?? CURRENT_VALUE)) return unchanged();
+        const entry = grid.kind === "sparse"
+          ? grid.tuples.find((candidate) => candidate.id === params.value) : undefined;
+        if (!entry) throw RequestError.invalidParams(undefined, "Unsupported Letta preset for the current model");
+        await this.applyPreset(params.sessionId, state, entry);
+        return unchanged();
       }
       throw RequestError.invalidParams(undefined, "Unknown session configuration option");
     });
@@ -784,6 +942,7 @@ export class LettaAcpAgent {
       // in-a-turn marker is cleared, so late tool traffic still reaches the
       // client but waits on a deadline.
       state.promptActive = false;
+      this.scheduleModelRefresh(params.sessionId, state);
     }
   }
 

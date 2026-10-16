@@ -407,6 +407,14 @@ describe("acpx client compatibility", () => {
       await request("initialize", { protocolVersion: 1, clientCapabilities: {} });
       const opened = await request("session/new", { cwd: join(import.meta.dir, ".."), mcpServers: [] });
       const sessionId = (opened.result as WireMessage).sessionId;
+      // JetBrains Air rejects a model list whose item names equal their values.
+      const models = ((opened.result as WireMessage).configOptions as Array<WireMessage>)
+        .find((option) => option.id === "model")?.options as Array<{ value: string; name: string }>;
+      expect(models.length).toBeGreaterThan(0);
+      for (const model of models) {
+        expect(model.name.trim()).not.toBe("");
+        expect(model.name).not.toBe(model.value);
+      }
       const invalid = await request("session/set_config_option", { sessionId, configId: "reasoning_effort", value: "bogus" });
       expect(invalid.error).toMatchObject({ code: -32602 });
       expect((invalid.error as WireMessage).message).toContain("Unsupported reasoning effort");

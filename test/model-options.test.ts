@@ -13,13 +13,52 @@ const entries = [
 describe("grouped model choices", () => {
   test("deduplicates exact handles, retaining provider and BYOK routes and raw efforts", () => {
     expect(modelOptions(entries)).toEqual([
-      { value: "openai/test", name: "openai/test" },
+      // Labels share no word-boundary prefix: the handle is shown decorated, never as its own name.
+      { value: "openai/test", name: "Model: openai/test" },
       { value: "lc-openai/test", name: "Test" },
       { value: "other/test", name: "Other test" },
     ]);
     expect(reasoningOption(reasoningEntries(entries, "openai/test", undefined, 100), "high"))
       .toMatchObject({ options: [{ value: "low", name: "low" }, { value: "high", name: "high" }] });
     expect(entries).toHaveLength(5);
+  });
+
+  test("every model name is a nonblank catalog label distinct from its exact handle value", () => {
+    // Live catalog shape: three effort presets, no plain entry, differing labels.
+    const gemini = ["low", "medium", "high"].map((effort) => ({
+      id: effort === "medium" ? "gemini-4-argon" : `gemini-4-argon-${effort}`,
+      handle: "google_ai/gemini-4-argon",
+      label: effort === "medium" ? "Gemini 4 Argon" : `Gemini 4 Argon (${effort})`,
+      description: "",
+      updateArgs: { reasoning_effort: effort, context_window: 180_000 },
+    }));
+    const catalog = [
+      ...gemini,
+      // A prefix that is not a whole word is not a shared label.
+      { id: "a", handle: "x/gpt", label: "GPT-6", description: "", updateArgs: { reasoning_effort: "low" } },
+      { id: "b", handle: "x/gpt", label: "GPT-6 Fast", description: "", updateArgs: { reasoning_effort: "high" } },
+      { id: "c", handle: "x/gpt2", label: "GPT", description: "", updateArgs: { reasoning_effort: "low" } },
+      { id: "d", handle: "x/gpt2", label: "GPT-6", description: "", updateArgs: { reasoning_effort: "high" } },
+      { id: "native/route", handle: "native/route", label: "native/route", description: "" },
+      { id: "padded", handle: "padded/route", label: "  Padded Model  ", description: "" },
+      { id: "blank", handle: "blank/route", label: "   ", description: "" },
+      { id: "mixed-1", handle: "mixed/route", label: "", description: "", updateArgs: { reasoning_effort: "low" } },
+      { id: "mixed-2", handle: "mixed/route", label: "Mixed", description: "", updateArgs: { reasoning_effort: "high" } },
+    ];
+    const options = modelOptions(catalog);
+    expect(options).toEqual([
+      { value: "google_ai/gemini-4-argon", name: "Gemini 4 Argon" },
+      { value: "x/gpt", name: "GPT-6" },
+      { value: "x/gpt2", name: "Model: x/gpt2" },
+      { value: "native/route", name: "Model: native/route" },
+      { value: "padded/route", name: "Padded Model" },
+      { value: "blank/route", name: "Model: blank/route" },
+      { value: "mixed/route", name: "Model: mixed/route" },
+    ]);
+    for (const option of [...options, ...modelOptions(entries)]) {
+      expect(option.name.trim()).not.toBe("");
+      expect(option.name).not.toBe(option.value);
+    }
   });
 
   test("resolves presets to stable handles and leaves custom/BYOK handles alone", () => {

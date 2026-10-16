@@ -40,7 +40,7 @@ export const EXECUTE_COMMANDS: ExecuteCommandSpec[] = [
   {
     name: "context-limit",
     description: "Set or reset the max context window",
-    hint: "tokens (empty to show current)",
+    hint: "tokens (empty to reset to the model default)",
   },
   { name: "reload", description: "Reload harness settings" },
   {

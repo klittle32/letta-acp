@@ -1,7 +1,7 @@
 import type { SessionConfigOption } from "@agentclientprotocol/sdk";
 import type { LettaCodeModelEntry } from "@letta-ai/letta-agent-sdk";
 
-const EFFORTS = [
+export const EFFORTS = [
   "none", "minimal", "low", "medium", "high", "xhigh", "max",
 ] as const;
 export type ReasoningEffort = typeof EFFORTS[number];
@@ -57,7 +57,10 @@ export interface ModelSnapshot {
   contextWindow?: number;
 }
 
-/** Match Letta Code's scoped model settings: a different model drops inheritance. */
+/** Match Letta Code's scoped model settings: a different model drops inheritance.
+ * Conversation fields override independently: a settings-only override (no
+ * conversation model) still applies to the agent's route.
+ */
 export function scopedModelSnapshot(agent: unknown, conversation?: unknown): ModelSnapshot {
   const base = record(agent);
   const legacy = record(base.llm_config);
@@ -69,8 +72,10 @@ export function scopedModelSnapshot(agent: unknown, conversation?: unknown): Mod
     !override.model || override.model === model ? baseWindow : undefined
   );
   const contextWindow = typeof window === "number" ? window : undefined;
-  if (typeof override.model === "string" && override.model) {
-    const sameModel = override.model === model;
+  const scopedModel = typeof override.model === "string" && override.model ? override.model : undefined;
+  const hasScopedSettings = Object.keys(record(override.model_settings)).length > 0;
+  if (scopedModel || hasScopedSettings) {
+    const sameModel = !scopedModel || scopedModel === model;
     const inherited = sameModel ? { ...legacy, ...saved } : {};
     const scoped = record(override.model_settings);
     // An explicit scoped selector (including null/provider default) replaces
@@ -85,7 +90,7 @@ export function scopedModelSnapshot(agent: unknown, conversation?: unknown): Mod
       delete inherited.thinking;
     }
     return {
-      model: override.model,
+      model: scopedModel ?? model,
       settings: { ...inherited, ...scoped },
       legacy: sameModel && !hasEffort ? legacy : {},
       contextWindow,
@@ -112,6 +117,22 @@ export function modelEntries(
   return entries.filter((entry) => entry.handle === handle || entry.handle === canonical);
 }
 
+export function presetWindow(entry: LettaCodeModelEntry): number | undefined {
+  const window = entry.updateArgs?.context_window;
+  return typeof window === "number" ? window : undefined;
+}
+
+/** Letta Code's runtime refuses to preserve this legacy server clamp unless a
+ * preset for the route carries exactly this window. */
+const LEGACY_CONTEXT_WINDOW_CLAMP = 128_000;
+
+/**
+ * Effort presets that keep the session's actual context window: the family
+ * whose preset window equals it, or presets that carry no window at all (the
+ * runtime preserves the current window for those, except the legacy clamp).
+ * An off-preset or unknown window offers no windowed presets, because applying
+ * any of them would change the context as a side effect.
+ */
 export function reasoningEntries(
   entries: LettaCodeModelEntry[],
   model: string | undefined,
@@ -119,32 +140,42 @@ export function reasoningEntries(
   contextWindow?: number,
 ): LettaCodeModelEntry[] {
   const candidates = modelEntries(entries, model, aliases);
-  // Exact preset windows must not cross families. For custom windows the
-  // runtime preserves same-family updates (except its legacy 128000 clamp).
-  // Multiple families with no exact match are unsafe: runtime inference uses
-  // agent legacy effort, which can differ from conversation-scoped effort.
-  const matchingWindow = contextWindow === undefined ? [] : candidates.filter(
-    (entry) => entry.updateArgs?.context_window === contextWindow);
-  if (!matchingWindow.length &&
-      new Set(candidates.map((entry) => entry.updateArgs?.context_window)).size > 1) return [];
-  const family = matchingWindow.length ? matchingWindow : candidates;
+  const matching = candidates.filter((entry) => presetWindow(entry) === contextWindow);
+  const family = matching.length ? matching
+    : contextWindow === LEGACY_CONTEXT_WINDOW_CLAMP ? []
+    : candidates.filter((entry) => presetWindow(entry) === undefined);
   return family.filter((entry) => presetEffort(entry) !== undefined);
 }
 
+/**
+ * Effort selector for routes whose presets carry no window (see preset-grid).
+ * A known effort with no applicable preset is still shown as the current value
+ * (ACP requires currentValue to be an option); it is state, not a choice.
+ */
 export function reasoningOption(
   entries: LettaCodeModelEntry[],
   effort: ReasoningEffort | undefined,
 ): SessionConfigOption | undefined {
   const supported = EFFORTS.filter((value) =>
     entries.some((entry) => presetEffort(entry) === value));
-  if (!effort || !supported.includes(effort)) return undefined;
+  if (!effort) return undefined;
+  const current = supported.includes(effort);
+  const options = EFFORTS.filter((value) => value === effort || supported.includes(value))
+    .map((value) => ({
+      value,
+      name: supported.includes(value) ? value : `${value} (current, not a Letta preset here)`,
+    }));
   return {
     id: "reasoning_effort",
     name: "Reasoning effort",
-    description: "Reasoning tier persisted by Letta for this session's model",
+    description: current
+      ? "Reasoning tier persisted by Letta for this session's model"
+      : supported.length
+        ? "Reasoning tier persisted by Letta is not one of its presets here; choose a listed tier to change it"
+        : "Reasoning tier persisted by Letta is not one of its presets here; use /model to choose a Letta preset",
     category: "thought_level",
     type: "select",
     currentValue: effort,
-    options: supported.map((value) => ({ value, name: value })),
+    options,
   };
 }
